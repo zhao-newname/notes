@@ -1,11 +1,12 @@
 # 内存管理
 
 ![http://ilinuxkernel.com/wp-content/uploads/2011/09/091011_1614_Linux1.png](pic/mm_segm_paging.png)
+![https://www.zhihu.com/question/274054284/answer/3203970743](https://picx.zhimg.com/80/v2-23f68bb6a217c98bde3120aa39cf29b5_1440w.webp?source=2c26e567)
 
 # 页（Pages）
 
 * 物理页为内存管理的最基本单元。
-* 内存管理单元（MMU)——管理内存并把虚拟地址转化为物理地址的硬件。
+* 内存管理单元（MMU）——管理内存并把虚拟地址转化为物理地址的硬件。
 * MMU以 **页（page）** 为单位进行处理，以页大小为单位管理系统中的页表。
 * 从虚拟内存角度来看，*页* 就是最小单位。
 * 体系结构不同，支持的页大小也不尽相同。32位支持4K的页，64位支持8K的页。
@@ -332,8 +333,8 @@ Process context, cannot sleep | Use `GFP_ATOMIC`, or perform your allocations wi
 Interrupt handler | Use `GFP_ATOMIC`.
 Softirq | Use `GFP_ATOMIC`.
 Tasklet | Use `GFP_ATOMIC`.
-Need DMA-able memory, can sleep | Use `(GFP_DMA | GFP_KERNEL)`.
-Need DMA-able memory, cannot sleep | Use `(GFP_DMA | GFP_ATOMIC)`, or perform your allocation at an earlier point when you can sleep.
+Need DMA-able memory, can sleep | Use `(GFP_DMA \| GFP_KERNEL)`.
+Need DMA-able memory, cannot sleep | Use `(GFP_DMA \| GFP_ATOMIC)`, or perform your allocation at an earlier point when you can sleep.
 
 ## kfree()
 * `kfree()`释放`kmalloc()`分配出来的内存块
@@ -443,90 +444,242 @@ static inline void __kunmap_atomic(void *addr)
 * `kmap_atomic()`建立一个临时映射。
 * `kmap_atomic()`禁止内核抢占，因为映射对每个处理器都是唯一的。
 * `kunmap_atomic()`取消映射。
+* 如果因为要从一个页面复制到另一个页面而需要映射两个页面，则需要严格嵌套 `kmap_atomic()` 调用，例如：
+  ```cpp
+  vaddr1 = kmap_atomic(page1);
+  vaddr2 = kmap_atomic(page2);
+  
+  memcpy(vaddr1, vaddr2, PAGE_SIZE);
+  
+  kunmap_atomic(vaddr2);
+  kunmap_atomic(vaddr1);
+  ```
+* kmap atomic map 使用一小组 address slots 中的一个 slot 进行映射，并且该映射仅在创建它的 CPU 上有效
+  * 这种设计意味着持有这些映射之一的代码必须在原子上下文中运行（因此得名 `kmap_atomic()`）
+  * 如果它要休眠或被转移到另一个 CPU，混乱和数据损坏几乎是必然的结果
+  * 因此，每当在内核空间中运行的代码创建原子映射时，它就不能再被抢占或迁移，并且不允许休眠，直到所有原子映射都被释放
+## 本地临时映射
+* *临时映射* 的实现引入了其使用区间需要禁用抢占的要求，这会降低系统的实时性能，为解决这个问题，引入了新增的本地临时映射 `kmap_local_page()` 
+  * 在之前的内核中，这些 slot 被存储在一个 per-CPU 数据结构中，因此它们会被运行在同一个 CPU 上的所有线程共享。这也是为什么在持有 atomic mapping 时不能允许抢占的原因之一。正在运行的进程和抢占它的进程可能都会试图使用相同的 slot，结果一般都会导致出现各种错误了
+  * 在新的方案中，mapping 被存储在 task_struct 结构中，因此它们对每个线程来说是唯一的
+* local page mapping 仍然只会在 local CPU 上被建立起来，这意味着持有这种映射的进程如果要做迁移的话肯定是自找麻烦。因此，虽然当内核代码建立 local mapping 时抢占仍然是允许的，但从一个 CPU 到另一个 CPU 的迁移动作是被禁止的
+* `kmap_atomic()` 和 `kmap_local()` 都是 local thread 和 local CPU 的，它们之间唯一的区别将是持有 mapping 时的执行上下文：
+  * atomic mapping 仍然禁用抢占
+  * 而 local mapping 只禁用迁移
+  * 除此以外，这两种 mapping 效果是相同的
+* 所以这个讨论 [Re [PATCH v2] x86_sgx Replace kmap_kunmap_atomic calls - Thomas Gleixner](https://lore.kernel.org/all/87zgcqo94z.ffs@tglx/#t) tglx 要表明的是：
+  * 禁止抢占和缺页是因为 `kmap_atomic()` 旧实现的依赖于此，而不是其适用的上下文需要这么它这么做，比如中断上下文。这个因果关系要搞清楚
+  * 利用 `kmap_atomic()` 会禁止抢占和缺页的副作用来实现的功能是愚蠢的
+  * 用 `kmap_atomic()` 都可以用 `kmap_local()` 替换。但需要分析替换为 `kmap_local()` 是否还需要附加禁抢占，如果还需要，那相当于还是用 `kmap_atomic()`
+* 为什么这么说，看看现在 `kmap_atomic()` 和 `kmap_local()` 的实现，其实最终调用的都是 `__kmap_local_page_prot()`
+  * include/linux/highmem-internal.h
+```cpp
+static inline void *kmap_local_page(struct page *page)
+{
+    return __kmap_local_page_prot(page, kmap_prot);
+}
+...
+static inline void *kmap_atomic_prot(struct page *page, pgprot_t prot)
+{
+    if (IS_ENABLED(CONFIG_PREEMPT_RT))
+        migrate_disable();
+    else
+        preempt_disable();
+
+    pagefault_disable();
+    return __kmap_local_page_prot(page, prot);
+}
+
+static inline void *kmap_atomic(struct page *page)
+{
+    return kmap_atomic_prot(page, kmap_prot);
+}
+```
 
 # Per-CPU
+* 见 [Per-CPU](percpu.md)
 
-* 对于给定处理器，Per-CPU的数据是唯一的。
-* 虽然访问 Per-CPU 数据不需要锁同步，但是禁止内核抢占还是需要的，防止出现伪并发。
-* `get_cpu()`和`put_cpu()`包含了对内核抢占的禁用和重新激活。
-* 2.6 Per-CPU 相关文件：
-  * include/linux/percpu.h
-  * arch/x86/include/asm/percpu.h
-  * include/linux/percpu-defs.h
-  * mm/slab.c
-  * mm/percpu.c
+# 几个对齐宏
+* 页对齐
+  * include/linux/mm.h
+```c
+/* to align the pointer to the (next) page boundary */
+#define PAGE_ALIGN(addr) ALIGN(addr, PAGE_SIZE)
 
-## 编译时Per-CPU数据
+/* to align the pointer to the (prev) page boundary */
+#define PAGE_ALIGN_DOWN(addr) ALIGN_DOWN(addr, PAGE_SIZE)
 
-* 声明 Per-CPU 变量
-  ```c
-  DECLARE_PER_CPU(type, name)
-  ```
-* 定义 Per-CPU 变量
-  ```c
-  DEFINE_PER_CPU(type, name)
-  ```
-* `get_cpu_var(var)`，`put_cpu_var(var)`和`per_cpu(name, cpu)`宏
-  ```c
-  #define per_cpu(var, cpu)   (*per_cpu_ptr(&(var), cpu))
+/* test whether an address (unsigned long or pointer) is aligned to PAGE_SIZE */
+#define PAGE_ALIGNED(addr)  IS_ALIGNED((unsigned long)(addr), PAGE_SIZE)
+```
+* 指针对齐
+```c
+#define __ALIGN_KERNEL(x, a)        __ALIGN_KERNEL_MASK(x, (typeof(x))(a) - 1)
+#define __ALIGN_KERNEL_MASK(x, mask)    (((x) + (mask)) & ~(mask))
+...
+/* @a is a power of 2 value */
+#define ALIGN(x, a)     __ALIGN_KERNEL((x), (a))
+#define ALIGN_DOWN(x, a)    __ALIGN_KERNEL((x) - ((a) - 1), (a))
+#define __ALIGN_MASK(x, mask)   __ALIGN_KERNEL_MASK((x), (mask))
+#define PTR_ALIGN(p, a)     ((typeof(p))ALIGN((unsigned long)(p), (a)))
+#define PTR_ALIGN_DOWN(p, a)    ((typeof(p))ALIGN_DOWN((unsigned long)(p), (a)))
+#define IS_ALIGNED(x, a)        (((x) & ((typeof(x))(a) - 1)) == 0)
+```
 
-  /*
-   * Must be an lvalue. Since @var must be a simple identifier,
-   * we force a syntax error here if it isn't.
-   */
-  #define get_cpu_var(var)                        \
-  (*({                                    \
-      preempt_disable();                      \
-      this_cpu_ptr(&var);                     \
-  }))
+# 参数
 
-  /*
-   * The weird & is necessary because sparse considers (void)(var) to be
-   * a direct dereference of percpu variable (var).
-   */
-  #define put_cpu_var(var)                        \
-  do {                                    \
-      (void)&(var);                           \
-      preempt_enable();                       \
-  } while (0)
-  ...'
-  ```
-### 注意
-* `per_cpu(name, cpu)`既不禁止抢占，也不提供锁保护。
+## lowmem_reserve_ratio
+* [lowmem_reserve_ratio](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html#lowmem-reserve-ratio) 位于 `/proc/sys/vm/lowmem_reserve_ratio`
+* 它是一个比率，意思是处于更低端的 zone 的对更高端的内存回退到低端内存分配时，低端内存的保留率，是一个防御性参数
+* 默认值为：
+```sh
+# cat /proc/sys/vm/lowmem_reserve_ratio
+256     256     32      0       0
+```
+* 比如对于 `sysctl` 中 `lowmem_reserve_ratio` 为 `256, 32` 的值的时候：
+  * 对于 `1G` 内存的机器 -> `(16M dma, 800M-16M normal, 1G-800M high)`
+  * 得到 `1G` 内存的机器 => `(16M dma, 784M normal, 224M high)`
+  *  `NORMAL` 回退到 `ZONE_DMA` 分配时，会给 `ZONE_DMA` 保留 `784M/256` 的内存给 `ZONE_DMA`
+  *  `HIGHMEM` 回退到 `ZONE_NORMAL` 分配时，会给 `ZONE_NORMAL` 保留 `224M/32` 的内存给 `ZONE_NORMAL`
+  *  `HIGHMEM` 回退到 `ZONE_DMA` 分配时，会给 `ZONE_DMA` 保留 `(224M+784M)/256` 的内存给 `ZONE_DMA`
+* 源码中的定义在 mm/page_alloc.c
+```c
+/*
+ * results with 256, 32 in the lowmem_reserve sysctl:
+ *  1G machine -> (16M dma, 800M-16M normal, 1G-800M high)
+ *  1G machine -> (16M dma, 784M normal, 224M high)
+ *  NORMAL allocation will leave 784M/256 of ram reserved in the ZONE_DMA
+ *  HIGHMEM allocation will leave 224M/32 of ram reserved in ZONE_NORMAL
+ *  HIGHMEM allocation will leave (224M+784M)/256 of ram reserved in ZONE_DMA
+ *
+ * TBD: should special case ZONE_DMA32 machines here - in those we normally
+ * don't need any ZONE_NORMAL reservation
+ */
+static int sysctl_lowmem_reserve_ratio[MAX_NR_ZONES] = {
+#ifdef CONFIG_ZONE_DMA
+    [ZONE_DMA] = 256,
+#endif
+#ifdef CONFIG_ZONE_DMA32
+    [ZONE_DMA32] = 256,
+#endif
+    [ZONE_NORMAL] = 32,
+#ifdef CONFIG_HIGHMEM
+    [ZONE_HIGHMEM] = 0,
+#endif
+    [ZONE_MOVABLE] = 0,
+};
+```
+* 举个例子：
+```c
+Node 0, zone      DMA
+  pages free     2816
+        boost    0
+        min      0
+        low      3
+        high     6
+        spanned  4095
+        present  3996
+        managed  3840
+        cma      0
+        protection: (0, 1040, 256496, 256496, 256496)
+...
+Node 0, zone      DMA32
+  pages free     264998
+        boost    0
+        min      32
+        low      284
+        high     536
+        spanned  1044480
+        present  414089
+        managed  266274
+        cma      0
+        protection: (0, 0, 255456, 255456, 255456)
+...
+Node 0, zone   Normal
+  pages free     63195905
+        boost    0
+        min      8389
+        low      73785
+        high     139181
+        spanned  66445312
+        present  66445312
+        managed  65396889
+        cma      0
+        protection: (0, 0, 0, 0, 0)
+...
+```
+* 在此示例中，
+  * 如果 normal 的页面（`index = 2`）分配请求到此 DMA zone，并且 `watermark[WMARK_HIGH]` 用于水标（watermark），则内核判断 **不应使用此 zone**，因为此时 DMA zone 的 `pages_free(2816)` **小于** `watermark + protection[2]（6 + 256496 = 256502）`。
+  * 如果 DMA32 的页面（`index = 1`）分配请求到此 DMA zone，并且 `watermark[WMARK_HIGH]` 用于水标（watermark），则 **可以使用此 zone**，因为此时 DMA zone 的 `pages_free(2816)` **大于** `watermark + protection[2]（6 + 1040 = 1046）`。
+  * 如果此 `protection` 值为 `0`，则此 zone 将用于 normal 页面要求。如果要求是 DMA zone（`index = 0`），则使用 `protection[0]（=0）`。
+* `zone[i]` 的 `protection[j]` 通过以下表达式计算：
+```c
+(i < j):
+  zone[i]->protection[j]
+  = (total sums of managed_pages from zone[i+1] to zone[j] on the node)
+    / lowmem_reserve_ratio[i];
+(i = j):
+   (should not be protected. = 0;)
+(i > j):
+   (not necessary, but looks 0)
+```
+* 从上面那个例子也可以看到 DMA zone（`zone[0]`）的 `protection[2] = 256496` 大于 DMA32 zone（`zone[1]`）的 `protection[2] = 255456`，因为比 DMA zone 高的 zone 的可管理页面比 DMA32 zone 的页面要多
+* 这个公式也意味着：
+  * **横比**：越高阶的 zone（比如 Normal zone）比它低阶的 zone（比如 DMA32 zone）更难从更低阶的 zone（比如 DMA zone）分到内存，例如在上面的例子中 `1040 < 256496`；
+  * **纵比**：高阶的 zone（比如 DMA32 zone）会比它低阶的 zone（比如 DMA zone）向上（比如 Normal zone）提供更多的内存，保留的内存会更少，例如在上面例子中 `255456 < 256496`
+* 如果想保护更多页面，较小的值是有效的。
+  * 最小值为 `1` (`1/1 -> 100%`)。阻止对应的高阶 zone 从本 zone 分配内存。
+  * 小于 `1` 的值将完全禁用页面保护。
+* 设置 `lowmem_reserve_ratio` 的代码实现在 mm/page_alloc.c::`setup_per_zone_lowmem_reserve()`
+* 可以想象为填充一个三维数组 `nodes[n].zone[i].protection[j]`
+  * 第一维：按照公式计算出 `zone[j]` 想从 `zone[i]` 分时，保留给 `zone[i]` 的页面数
+  * 第二维：NUMA node 的每个 zone 构成
+  * 第三维：NUMA nodes
+```c
+/*
+ * setup_per_zone_lowmem_reserve - called whenever
+ *  sysctl_lowmem_reserve_ratio changes.  Ensures that each zone
+ *  has a correct pages reserved value, so an adequate number of
+ *  pages are left in the zone after a successful __alloc_pages().
+ */
+static void setup_per_zone_lowmem_reserve(void)
+{
+    struct pglist_data *pgdat;
+    enum zone_type i, j;
+    //遍历 NUMA nodes，即 struct pglist_data 数组；三维
+    for_each_online_pgdat(pgdat) {
+        for (i = 0; i < MAX_NR_ZONES - 1; i++) { //遍历一个 NUMA node 的每个 zone；二维
+            struct zone *zone = &pgdat->node_zones[i];
+            int ratio = sysctl_lowmem_reserve_ratio[i];
+            bool clear = !ratio || !zone_managed_pages(zone); //如果该 zone 的 ratio 为零或者可管理页面为零，清除 lowmem_reserve[i]
+            unsigned long managed_pages = 0;
 
-  > Another subtle note:These compile-time per-CPU examples **do not work for modules** because the linker actually creates them in a unique executable section (for the curious, `.data.percpu` ). If you need to access per-CPU data from modules, or if you need to create such data dynamically, there is hope.
-
-## 运行时Per-CPU数据
-
-* 运行时创建和释放Per-CPU接口
-  ```c
-  void *alloc_percpu(type); /* a macro */
-  void *__alloc_percpu(size_t size, size_t align);
-  void free_percpu(const void *);
-  ```
-* `__alignof__` 是gcc的一个功能，它返回指定类型或 lvalue 所需的（或建议的，要知道有些古怪的体系结构并没有字节对齐的要求） 对齐 **字节数**。
-  * 如果指定一个 lvalue，那么将返回 lvalue 的最大对齐字节数。
-* 使用运行时的 Per-CPU 数据
-  ```c
-  get_cpu_var(ptr); /* return a void pointer to this processor’s copy of ptr */
-  put_cpu_var(ptr); /* done; enable kernel preemption */
-  ```
-## 使用Per-CPU数据的原因
-
-* 减少数据锁定
-  * 记住“只有这个处理器能访问这个数据”的规则是编程约定。
-  * 并不存在措施禁止你从事欺骗活动。
-  * 有越界的可能？
-* 大大减少缓存失效
-  * 失效发生在处理器试图使它们的缓存保持同步时。
-    * 如果一个处理器操作某个数据，而该数据又存放在其他处理器缓存中，那么存放该数据的那个处理器必须清理或刷新自己的缓存。
-    * 持续不断的缓存失效称为 **缓存抖动**。这样对系统性能影响颇大。
-  * 使用 Per-CPU 将使得缓存影响降至最低，因为理想情况下只会访问自己的数据。
-  * *percpu* 接口 **cache-align** 所有数据，以便确保在访问一个处理器的数据时，不会将另一个处理器的数据带入同一个cache line上。
-* 注意：**不能在访问 Per-CPU 数据过程中睡眠**，否则，醒来可能在其他CPU上。
-* Per-CPU 的新接口并不兼容之前的内核。
+            for (j = i + 1; j < MAX_NR_ZONES; j++) { //从 zone[i+1] 开始遍历高阶 zone
+                struct zone *upper_zone = &pgdat->node_zones[j]; //高阶 zone 指针
+                //根据公式，可管理页面数为同一 NUMA node 从 zone[i+1] 到 zone[j] 的可管理页面数的总和
+                managed_pages += zone_managed_pages(upper_zone);
+                //如果该 zone 的 ratio 为零或者可管理页面为零，清除 lowmem_reserve[i]
+                if (clear)
+                    zone->lowmem_reserve[j] = 0;
+                else  //按照公式计算出 zone[j] 想从 zone[i] 分时，保留给 zone[i] 的页面数
+                    zone->lowmem_reserve[j] = managed_pages / ratio; //一维
+            }
+        }
+    }
+    //更新/更新总的保留页面
+    /* update totalreserve_pages */
+    calculate_totalreserve_pages();
+}
+```
+* `calculate_totalreserve_pages()` 的大概思路如下：
+  * 先在一维找出 *最大的保留页面 zone->lowmem_reserve[j]* 加上该 zone 的高水标 `high_wmark_pages(zone)` 得到 `max`
+  * 在第二维 zone 一级上遍历，各级 zone 的 `max` 累加进 `pgdat->totalreserve_pages`
+  * 第三维 nodes 一级上遍历，累加进全局变量 `totalreserve_pages`
 
 # 参考资料
 * [/PROC/MEMINFO之谜](http://linuxperf.com/?p=142)
 * [Linux内核高端内存](http://ilinuxkernel.com/?p=1013)
 * [Per-CPU variables](https://0xax.gitbooks.io/linux-insides/content/Concepts/linux-cpu-1.html)
+* [High Memory Handling — The Linux Kernel documentation](https://www.kernel.org/doc/html/next/mm/highmem.html)
+* [LWN：把atomic kmap改成local kmap！_LinuxNews搬运工](https://blog.csdn.net/Linux_Everything/article/details/110016935)
+* [Linux系统启动之后，物理内存的布局是怎么样的？](https://www.zhihu.com/question/274054284/answer/3203970743)

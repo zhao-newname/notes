@@ -3,6 +3,19 @@
 # Architectures
 ## ARM
 - [ARM64 的一些基本概念](arch/arm64/basic.md)
+
+## Intel
+- [AMX](arch/intel/amx.md)
+- [APIC](arch/intel/apic.md)
+- [APIC 虚拟化和虚拟中断](arch/intel/apicv_vintr.md)
+- [Buslock](arch/intel/buslock.md)
+- [Memory Cache Control](arch/intel/cache_control.md)
+- [Multi-Processors Management](arch/intel/MP_management.md)
+- [Linear Address Masking (LAM)](arch/intel/lam.md)
+
+### VT-d
+- [Vt-d Overview](arch/intel/vt-d/vt-d-ov.md)
+
 # Computer Science
 - [Cache](computer_science/cache.md)
 - [TLB](computer_science/tlb.md)
@@ -18,9 +31,15 @@
 - [设备模型](kernel/dev_model.md)
 - [Linux 图形](kernel/graphic/Linux-Graphic.md)
 - [中断](kernel/irq.md)
-- [NMI](kernel/nmi)
+- [x86 内核栈](kernel/stack_x86-64.md)
+- [NMI](kernel/nmi/nmi.md)
+- [IPI - x86](kernel/ipi.md)
 - [Kexec](kernel/kexec.md)
+- [Kexec - x86](kernel/kexec_x86.md)
 - [Kdump](kernel/kdump.md)
+- [MCE](kernel/mce.md)
+- [内核线程及 Stop Machine](kernel/stop_machine.md)
+- [CPU 热插拔](kernel/cpu_hotplug.md)
 
 ## 锁
 - [锁的基本知识](kernel/lock/Lock-1.md)
@@ -47,6 +66,10 @@
 - [slab](kernel/mm/slab.md)
 - [slub](kernel/mm/slub.md)
 - [学习 /proc/meminfo](kernel/mm/meminfo.md)
+- [内核中的直接映射](kernel/mm/direct_map.md)
+- [缺页处理](kernel/mm/fault.md)
+- [Folio](kernel/mm/folio.md)
+- [Vmalloc](kernel/mm/vmalloc.md)
 
 ## 网络
 - [Monitoring and Tuning the Linux Networking Stack: Receiving Data](kernel/networking/monitoring-tuning-linux-networking-stack-receiving-data.md)
@@ -78,3 +101,8 @@
 
 # Virtualization
 - [docker](virtualization/docker/docker.md)
+## KVM
+- [APIC 虚拟化](virtualization/kvm/apicv.md)
+- [虚拟化异常](virtualization/kvm/exception.md)
+- [Posted Interrupt](virtualization/kvm/posted_interrupt.md)
+- [TDP MMU 缺页](virtualization/kvm/tdp_page_fault.md)

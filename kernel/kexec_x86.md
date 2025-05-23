@@ -5,10 +5,11 @@
 ```c
 start_kernel()
 -> setup_arch()
-   -> reserve_crashkernel()
+   -> arch_reserve_crashkernel()
       -> parse_crashkernel() //解析 crashkernel=XM 参数
-      -> memblock_phys_alloc_range() //根据参数分配 memblock
-      -> insert_resource(&iomem_resource, &crashk_res); //这样在 /proc/iomem 就能看到分配的 "Crash kernel" range 了
+      -> reserve_crashkernel_generic()
+         -> memblock_phys_alloc_range() //根据参数分配 memblock
+         -> insert_resource(&iomem_resource, &crashk_res); //这样在 /proc/iomem 就能看到分配的 "Crash kernel" range 了
 ```
 
 ### 用户态 kexec-tools
@@ -81,7 +82,7 @@ if (!do_kexec_file_syscall) //-c, --kexec-syscall
    |                     elf_info->kern_size = size; // 得到运行时内核代码段所在 Program 段的大小
    |                     return 0;
    |                  }
-   |            -> info->backup_start = add_buffer(info, ...) //加入 backup region segment 用于存储备份数据
+   |            -> info->backup_start = add_buffer(info, ...) //加入 backup region segment 用于存储 backup data
    |            -> crash_create_elf64_headers(..., &elf_info, ..., &tmp, ...) //创建 elfcorehdr segment 用于存储 crash 内存镜像数据，即 FUNC()
    |               -> get_kernel_vmcoreinfo(&vmcoreinfo_addr, &vmcoreinfo_len) //读入 /sys/kernel/vmcoreinfo 的信息
    |                  -> get_vmcoreinfo("/sys/kernel/vmcoreinfo", addr, len); //结果存入 addr 和 len
@@ -184,7 +185,7 @@ if (!do_kexec_file_syscall) //-c, --kexec-syscall
   5. 修正`info->entry` 和`info->rhdr.e_entry`为重定位到 “Crash kernel” region 后的`purgatory_start`例程的物理地址
   6. 遍历`ehdr->e_shdr`，重定位 section 中的符号
 * Backup data
-> On x86 machines, the first 640 KB of physical memory is needed to boot, regardless of where the kernel loads. Therefore, kexec backs up this region just before rebooting into the dump-capture kernel.
+> On x86 machines, the first 640 KB of physical memory is needed to boot, regardless of where the kernel loads. Therefore, kexec backs up this region just before rebooting into the dump-capture kernel. For simpler handling, the whole low 1M is reserved to avoid any later kernel or device driver writing data into this area. Like this, the low 1M can be reused as system RAM by kdump kernel without extra handling.
 * `get_backup_area()`会找到第一个大于 640 KiB 的 System RAM region 作为备份区，比如`0000000000001000-000000000009fbff`，并存储在`info->backup_src_start`和`info->backup_src_size`里
 * 把 backup data 加入到`segment[]`数组后会返回其在 Crash kernel region 的物理地址`info->backup_start = add_buffer(info, ...)`
 * purgatory 阶段的`crashdump_backup_memory()`会把`backup_src_start`开始的长度为`backup_src_size`数据拷贝到`backup_start`处
@@ -314,7 +315,7 @@ PURGATORY_SRCS+=$($(ARCH)_PURGATORY_SRCS)
 >
 > 事实上，除了收集信息功能外，setup.bin 被忽略的另一个重要功能就是负责在内核和 Bootloader 之间传递信息。例如，在加载内核时，Bootloader 需要从 setup.bin 中获取内核是否是可重定位的、内核的对齐要求、内核建议的加载地址等。32 位启动协议约定在 setup.bin 中分配一块空间用来承载这些信息，在构建映像时，内核构建系统需要将这些信息写到 setup.bin 的这块空间中。所以，虽然 setup.bin 已经失去了其以往的作用，但还不能完全放弃，其还要作为内核与 Bootloader 之间传递数据的桥梁，而且还要照顾到某些不能使用 32 位启动协议的场合。
 
-
+* 启动协议还规定，Bootloader 加载内核时`%rsi`必须存放`struct boot_params`的基地址
 ##### x86_linux_header
 
 * kexec/include/x86/x86-linux.h
@@ -375,7 +376,7 @@ PURGATORY_SRCS+=$($(ARCH)_PURGATORY_SRCS)
 
 ##### 内核中的 setup_header
 * 见 arch/x86/include/uapi/asm/bootparam.h 的`struct setup_header`结构体的原型。
-* `arch/x86/boot/header.S`会被编译成`arch/x86/boot/header.o`，这个文件会和其他文件一起编译进`arch/x86/boot/setup.elf`，接着`setup.elf`会被`objcopy`去掉无用的信息成为`setup.bin`，这个文件会被和第二次编译出来的`vmlinux.bin`合并成`bzImage`。所以`header.o`和`setup.elf`去掉 ELF 头与`setup.bin`，`bzImage`的前面一段的内容是一样的，构成`x86_linux_header`
+* `arch/x86/boot/header.S`会被编译成`arch/x86/boot/header.o`，这个文件会和其他文件一起编译进`arch/x86/boot/setup.elf`，接着`setup.elf`会被`objcopy`去掉无用的信息成为`setup.bin`，这个文件会被和第二次编译出来的`vmlinux.bin`合并成`bzImage`。所以`header.o`和`setup.elf`去掉 ELF 头与`setup.bin`，`bzImage`的前面一段的内容是一样的，构成`x86_linux_header`（但`bzImage`的一部分内容会被`arch/x86/boot/tools/build`修改）。
 * arch/x86/boot/header.S
 ```s
 ...
@@ -492,8 +493,8 @@ static int do_bzImage64_load(...)
     elf_rel_get_symbol(&info->rhdr, "entry64_regs", &regs64,
                  sizeof(regs64)); //从已加载的 segment 中找到变量 entry64_regs，把内容存到本地变量 regs64
     regs64.rbx = 0;           /* Bootstrap processor */
-    regs64.rsi = setup_base;  /* Pointer to the parameters */ // real_mode_data 的地址，purgatory 会用到
-    regs64.rip = addr + 0x200; /* the entry point for startup_64 */ // addr 是重定位后的 crash kernel 的地址，+ 0x200 的解释见下面
+    regs64.rsi = setup_base;  /* Pointer to the parameters */ //boot parameters/real_mode_data 的地址，purgatory 会用到
+    regs64.rip = addr + 0x200; /* the entry point for startup_64 */ //addr 是重定位后的 crash kernel 的地址，+ 0x200 的解释见下面
     regs64.rsp = elf_rel_get_addr(&info->rhdr, "stack_end"); /* Stack, unused */
     elf_rel_set_symbol(&info->rhdr, "entry64_regs", &regs64,
                  sizeof(regs64)); //本地变量 regs64 的内容设置回已加载的 segment 的变量 entry64_regs
@@ -503,7 +504,7 @@ static int do_bzImage64_load(...)
 ```
 * `regs64.rip = addr + 0x200;`里的`0x200`是 ABI 的规定。因为用的是 bzImage，所以我们看的是 arch/x86/boot/compressed/head_64.S 这个文件：
   * arch/x86/boot/compressed/head_64.S
-  ```c
+  ```cpp
       .code64
       .org 0x200
   SYM_CODE_START(startup_64)
@@ -557,7 +558,82 @@ machine_kexec()
 * 所以说，`real_mode_data` segment 包含 bzImage 中拷贝出来的一小部分内容，然后被重定向以后交给内核，最后被用在了这里。此外，它还必须包含启动协议中 BIOS 需要向内核提供的数据，这些数据主要由`setup_linux_bootloader_parameters_high()`和`setup_linux_system_parameters()`这两个函数中填充。
   * 其中，`setup_linux_bootloader_parameters_high()`设置了`real_mode->cmd_line_ptr`指针，并拷贝了命令行参数到`((char *)real_mode) + cmdline_offset`处，也就时零页中的`boot_params.hdr.cmd_line_ptr`处。
   * 也就是说，命令行参数是通过`real_mode_data` segment 来传递的。
+* 按照 64-bit 启动协议的规定，跳转到内核入口时，`%rsi` 必须持有 `struct boot_params` 的基地址，这是通过 kexec/arch/x86_64/kexec-bzImage64.c`do_bzImage64_load()` 中的 `regs64.rsi = setup_base` 预先设定的，因为这个值在 load image 到 crash kernel region 的时候就算出来了。
 
+#### 为什么捕捉内核启动时只能看见和保留内存
+1. 内核启动后能使用的内存信息是根据零页中的 `struct boot_e820_entry e820_table[E820_MAX_ENTRIES_ZEROPAGE]`得来的，例如，启动时可以看到打印如下：
+  ```c
+  BIOS-provided physical RAM map:
+  BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable
+  BIOS-e820: [mem 0x000000000009fc00-0x000000000009ffff] reserved
+  BIOS-e820: [mem 0x00000000000f0000-0x00000000000fffff] reserved
+  BIOS-e820: [mem 0x0000000000100000-0x000000005ffd4fff] usable
+  BIOS-e820: [mem 0x000000005ffd5000-0x000000005fffffff] reserved
+  BIOS-e820: [mem 0x00000000b0000000-0x00000000bfffffff] reserved
+  BIOS-e820: [mem 0x00000000fed1c000-0x00000000fed1ffff] reserved
+  BIOS-e820: [mem 0x00000000fffc0000-0x00000000ffffffff] reserved
+  ```
+2. 启动后会被 I/O 设备、内核逐渐使用掉，就是在`/proc/iomem`中看到的一些使用情况
+3. `get_crash_memory_ranges()`会通过`/proc/iomem`的信息填充`crash_memory_range[]`
+4. 从`crash_memory_range[]`数组中剔除（为 crash kernel 保留的内存 region）`crash_reserved_mem[]`数组的范围
+5. 在`crash_memory_range[]`数组中找到第一个类型为`System RAM` 640 KiB region 作为 backup data
+6. `load_crashdump_segments()`中，先分配`struct memory_range *memmap_p`
+7. 把 backup data 范围通过`add_memmap()`函数加到`memmap_p`数组
+8. 把`crash_reserved_mem[]`数组通过`add_memmap()`函数加到`memmap_p`数组
+9. 创建 backup region segment，并把该范围通过`delete_memmap()`函数从`memmap_p`数组剔除
+10. 创建`elfcorehdr` segment，把该范围通过`delete_memmap()`函数从`memmap_p`数组剔除
+11. 遍历`mem_range`，即`get_crash_memory_ranges()`填充的`crash_memory_range[]`数组，把以下类型的 region 添加到`memmap_p`数组
+  * `RANGE_ACPI`: ACPI Tables
+  * `RANGE_ACPI_NVS`：ACPI Non-volatile Storage
+  * `RANGE_RESERVED`：Reserved，reserved
+  * `RANGE_PMEM`：Persistent Memory
+  * `RANGE_PRAM`：Persistent Memory (legacy)
+12. 在`setup_e820()`通过`add_e820_map_from_mr()`及`setup_e820_ext()`把`memmap_p`数组里的范围填充到`real_mode_data`的`e820_map[]`数组，其实也就是给 crash kernel 准备的零页的`e820_table[]`数组
+    ```c
+    BIOS-provided physical RAM map:
+    BIOS-e820: [mem 0x0000000000000000-0x0000000000000fff] reserved
+    BIOS-e820: [mem 0x0000000000001000-0x000000000009fbff] usable
+    BIOS-e820: [mem 0x000000000009fc00-0x000000000009ffff] reserved
+    BIOS-e820: [mem 0x00000000000f0000-0x00000000000fffff] reserved
+    BIOS-e820: [mem 0x000000003f000000-0x000000005ef5cfff] usable
+    BIOS-e820: [mem 0x000000005efffc00-0x000000005effffff] usable
+    BIOS-e820: [mem 0x000000005ffd5000-0x000000005fffffff] reserved
+    BIOS-e820: [mem 0x00000000b0000000-0x00000000bfffffff] reserved
+    BIOS-e820: [mem 0x00000000fed1c000-0x00000000fed1ffff] reserved
+    BIOS-e820: [mem 0x00000000fffc0000-0x00000000ffffffff] reserved
+    ```
+* 对应的 segments 数组为
+  ```c
+  1) Crash kernel bzImage
+  segment[0].buf   = 0x7f6449f95810
+  segment[0].bufsz = 0x91ce60
+  segment[0].mem   = 0x5d000000
+  segment[0].memsz = 0x1f3f000
+  
+  2) real_mode_data
+  segment[1].buf   = 0x55c74044aa10
+  segment[1].bufsz = 0x3936
+  segment[1].mem   = 0x5ef50000
+  segment[1].memsz = 0x4000
+  
+  3) purgatory
+  segment[2].buf   = 0x55c7404437b0
+  segment[2].bufsz = 0x70e0
+  segment[2].mem   = 0x5ef54000
+  segment[2].memsz = 0x9000
+  
+  4) elfcoreheader
+  segment[3].buf   = 0x55c740441910
+  segment[3].bufsz = 0x400
+  segment[3].mem   = 0x5ef5d000
+  segment[3].memsz = 0x4000
+  
+  5) backup_data
+  segment[4].buf   = 0x7f6449ef3010
+  segment[4].bufsz = 0x9ec00
+  segment[4].mem   = 0x5ef61000
+  segment[4].memsz = 0x9f000
+  ```
 ### 内核加载 crash 内核镜像
 ```c
 kernel/kexec.c
@@ -586,6 +662,7 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments, ..
    -> machine_kexec_prepare(image)
          start_pgtable = page_to_pfn(image->control_code_page) << PAGE_SHIFT; //根据 page 结构的指针找到 control_code_page 的物理地址
          init_pgtable(image, start_pgtable) //负责给 crash kernel 用到的内存建立恒等映射，见下面详解
+         -> init_transition_pgtable(image, level4p)
    -> kimage_crash_copy_vmcoreinfo(image)
       -> vmcoreinfo_page = kimage_alloc_control_pages(image, 0); //对于 crash 需要拷贝一份 vmcoreinfo 到 "Crash kernel" region
       -> safecopy = vmap(&vmcoreinfo_page, 1, VM_MAP, PAGE_KERNEL) //给该页一个当前内核中的虚拟地址
@@ -616,11 +693,11 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments, ..
 * 确实需要多于一页的 control page 的唯一情况是，对于那些无法禁用 MMU 体系结构，必须为所有内存生成一个恒等映射的页表。
 * 由于需求不高，所以分配器的实现也非常简单，即在保留内存区域（reserved memory region）找到第一个大小合适的空洞，然后分配所有的内存，直到包含空洞。
 * 在`kimage_alloc_crash_control_pages()`函数中，会在 "Crash kernel" region 中找一个大于 2<sup>order</sup> 的空洞，并返回对应的`struct page`的指针，作用和 buddy system 的`alloc_pages()`类似
-* `image->control_code_page = kimage_alloc_control_pages(image, get_order(KEXEC_CONTROL_PAGE_SIZE))` 这里`KEXEC_CONTROL_PAGE_SIZE (4096UL + 4096UL)`会申请两个相连的页面，一个用作 PGD，另一个用来放`relocate_kernel`例程的代码
+* `image->control_code_page = kimage_alloc_control_pages(image, get_order(KEXEC_CONTROL_PAGE_SIZE))` 这里`KEXEC_CONTROL_PAGE_SIZE (4096UL + 4096UL)`会申请两个相连的页面，一个用作恒等映射 PGD，另一个用来放`relocate_kernel`例程的代码
 * `init_pgtable()`会给 crash kernel 用到的内存建立恒等映射，里面有`level4p = (pgd_t *)__va(start_pgtable)`（`start_pgtable`是 control page 的物理地址）说明这个页面就是准备用来做 PGD 的！
 
 #### 建立恒等映射（identity mapping）
-* 对于 x86，arch/x86/kernel/machine_kexec_64.c 中的`init_pgtable()`负责给 crash kernel 用到的内存建立恒等映射
+* 建立恒等映射的内存分配函数 `alloc_pgt_page()` 用的 `kimage_alloc_control_pages()` 从 control pages 里分配内存
   * arch/x86/kernel/machine_kexec_64.c
 ```c
 static void *alloc_pgt_page(void *data)
@@ -628,16 +705,18 @@ static void *alloc_pgt_page(void *data)
     struct kimage *image = (struct kimage *)data;
     struct page *page;
     void *p = NULL;
-    // 对于 crash 场景会调用 kimage_alloc_crash_control_pages() 在 "Crash kernel" 区域中找一个空 page
+    //对于 crash 场景会调用 kimage_alloc_crash_control_pages() 在 "Crash kernel" 区域中找一个空 page
     page = kimage_alloc_control_pages(image, 0);
     if (page) {
         p = page_address(page); // struct page 指针转成指向该页帧的虚拟地址
         clear_page(p);
     }
-    // 返回的是一个虚拟地址
+    //返回的是一个虚拟地址
     return p;
 }
-
+```
+* 对于 x86，arch/x86/kernel/machine_kexec_64.c 中的`init_pgtable()`负责给 crash kernel 用到的内存建立恒等映射
+```c
 static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
 {
     struct x86_mapping_info info = {
@@ -650,11 +729,11 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
     pgd_t *level4p;
     int result;
     int i;
-    // 之前分配到的第一个 control page 作为 PGD
+    //之前分配到的第一个 control page 作为 PGD
     level4p = (pgd_t *)__va(start_pgtable); //这里得到的是用当前 PGD 转换得到的虚拟地址
     clear_page(level4p);
 ...
-    // 给 E820 分配的内存建立恒等映射
+    //给 E820 分配的内存建立恒等映射
     for (i = 0; i < nr_pfn_mapped; i++) {
         mstart = pfn_mapped[i].start << PAGE_SHIFT;
         mend   = pfn_mapped[i].end << PAGE_SHIFT;
@@ -664,7 +743,7 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
         if (result)
             return result;
     }
-    // 给 segments 数组里的各 segment 建立恒等映射
+    //给 segments 数组里的各 segment 建立恒等映射
     /*
      * segments's mem ranges could be outside 0 ~ max_pfn,
      * for example when jump back to original kernel from kexeced kernel.
@@ -681,7 +760,7 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
         if (result)
             return result;
     }
-    // 给 EFI systab 和 ACPI tables 占用的内存建立恒等映射
+    //给 EFI systab 和 ACPI tables 占用的内存建立恒等映射
     /*
      * Prepare EFI systab and ACPI tables for kexec kernel since they are
      * not covered by pfn_mapped.
@@ -693,11 +772,10 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
     result = map_acpi_tables(&info, level4p);
     if (result)
         return result;
-    // 设置例程 relocate_kernel 的恒等映射页表项
-    return init_transition_pgtable(image, level4p); //在恒等映射页表中创建 relocate_kernel 例程原始地址的页表项
+    //设置例程 relocate_kernel 的恒等映射页表项，这是恒等映射的关键
+    return init_transition_pgtable(image, level4p);
 }
 ```
-
 * `kernel_ident_mapping_init()`是负责建立一个范围的恒等映射的接口，大体思路是这样：
   1. 它先检查某一页表条目是否被映射
   2. 如果已经映射了，则调用它下一级页表的恒等映射初始化函数，如`ident_p4d_init(info, p4d, addr, next)`去初始化下一级的页表
@@ -721,8 +799,69 @@ static void ident_pmd_init(struct x86_mapping_info *info, pmd_t *pmd_page,
     }
 }
 ```
+* 恒等映射的关键是，变换代码在原来的页表和恒等映射的页表都有映射
+  * 这里变换代码是 `relocate_kernel`，它在 `machine_kexec()` 的时候会被拷贝到 `image->control_code_page` 两个相邻页面的第二个页面的开始处
+  * 这段代码在原来的页表中就有映射，现在在恒等映射页表中把它映射到 control page 中放置代码的起始处
+  * 切换页表后，变换代码没走到跳转为恒等映射的低地址前，`$RIP` 还是原来的高地址，只是恒等映射页表已将它映射到 control page 区域中的物理地址了，CPU 实际上是从这些物理地址去取指令了
+  * 这一段内存的映射是恒等映射中唯一不恒等的映射
+```cpp
+static int init_transition_pgtable(struct kimage *image, pgd_t *pgd)
+{
+    pgprot_t prot = PAGE_KERNEL_EXEC_NOENC;
+    unsigned long vaddr, paddr;
+    int result = -ENOMEM;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    //走表时用的索引还是根据虚拟地址来的
+    vaddr = (unsigned long)relocate_kernel;
+    paddr = __pa(page_address(image->control_code_page)+PAGE_SIZE);
+    pgd += pgd_index(vaddr);
+    if (!pgd_present(*pgd)) {
+        p4d = (p4d_t *)get_zeroed_page(GFP_KERNEL); //页表页还是从 buddy 分的
+        if (!p4d)
+            goto err;
+        image->arch.p4d = p4d;
+        set_pgd(pgd, __pgd(__pa(p4d) | _KERNPG_TABLE));
+    }
+    p4d = p4d_offset(pgd, vaddr);
+    if (!p4d_present(*p4d)) {
+        pud = (pud_t *)get_zeroed_page(GFP_KERNEL);
+        if (!pud)
+            goto err;
+        image->arch.pud = pud;
+        set_p4d(p4d, __p4d(__pa(pud) | _KERNPG_TABLE));
+    }
+    pud = pud_offset(p4d, vaddr);
+    if (!pud_present(*pud)) {
+        pmd = (pmd_t *)get_zeroed_page(GFP_KERNEL);
+        if (!pmd)
+            goto err;
+        image->arch.pmd = pmd;
+        set_pud(pud, __pud(__pa(pmd) | _KERNPG_TABLE));
+    }
+    pmd = pmd_offset(pud, vaddr);
+    if (!pmd_present(*pmd)) {
+        pte = (pte_t *)get_zeroed_page(GFP_KERNEL);
+        if (!pte)
+            goto err;
+        image->arch.pte = pte;
+        set_pmd(pmd, __pmd(__pa(pte) | _KERNPG_TABLE));
+    }
+    pte = pte_offset_kernel(pmd, vaddr);
 
-## 发生 kernel panic 时的内核切换
+    if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+        prot = PAGE_KERNEL_EXEC;
+    //映射的最终目标是填入 control page 中的物理地址
+    set_pte(pte, pfn_pte(paddr >> PAGE_SHIFT, prot));
+    return 0;
+err:
+    return result;
+}
+```
+
+## kexec 内核切换
 
 ### 调用 machine_kexec() 的几个场景
 * `machine_kexec()`是 kexec 统一的入口函数
@@ -731,13 +870,18 @@ static void ident_pmd_init(struct x86_mapping_info *info, pmd_t *pmd_page,
   SYSCALL_DEFINE4(reboot, ...)
     case LINUX_REBOOT_CMD_KEXEC:
     -> kernel_kexec()
-      -> machine_kexec(kexec_image)
+       -> migrate_to_reboot_cpu() //将任务都迁移到 kexec 的 CPU
+       -> kernel_restart_prepare("kexec reboot")
+       -> cpu_hotplug_enable()
+       -> machine_shutdown() //让其他 CPU 都停下来，见下面详解
+       -> machine_kexec(kexec_image)
   ```
 * 对于 kernel panic 的场景有，则通过`__crash_kexec()`调用`machine_kexec()`
   ```c
   panic()
+  -> atomic_notifier_call_chain(&panic_notifier_list, 0, buf) //这里通知 panic_notifier_list 上的 notifier，各子系统可扩展 panic 时的动作
   -> __crash_kexec(NULL)
-    -> machine_kexec(kexec_crash_image)
+     -> machine_kexec(kexec_crash_image)
   ```
   或者
   ```c
@@ -751,9 +895,21 @@ static void ident_pmd_init(struct x86_mapping_info *info, pmd_t *pmd_page,
              -> update_vmcoreinfo_note()
                 -> append_elf_note(vmcoreinfo_note, VMCOREINFO_NOTE_NAME, 0, vmcoreinfo_data, ...)//拷贝 vmcoreinfo_data 到 vmcoreinfo_note
                 -> final_note(vmcoreinfo_note)
-          -> machine_crash_shutdown(&fixed_regs)
+          -> machine_crash_shutdown(&fixed_regs) //注意与快速切换场景的 machine_shutdown() 区分
              -> machine_ops.crash_shutdown(regs) //arch 相关的 crash_shutdown 回调，x86 的 arch/x86/kernel/crash.c
-             => native_machine_crash_shutdown(regs)
+             => native_machine_crash_shutdown(regs) //快速切换场景则是 native_machine_shutdown()
+                -> crash_smp_send_stop()
+                   if (smp_ops.crash_stop_other_cpus)
+                   -> smp_ops.crash_stop_other_cpus()
+                   => kdump_nmi_shootdown_cpus()
+                      -> nmi_shootdown_cpus(kdump_nmi_callback)
+                            crashing_cpu = safe_smp_processor_id();
+                            shootdown_callback = callback; // callback 是入参 kdump_nmi_callback
+                            //crash_nmi_callback() 注册为 NMI 回调函数，会调 shootdown_callback() 即 kdump_nmi_callback()，
+                            //kdump_nmi_callback() 调到 crash_save_cpu(regs, cpu)，从而让其他 CPU 的寄存器信息保存到 crash note
+                            if (register_nmi_handler(NMI_LOCAL, crash_nmi_callback, NMI_FLAG_FIRST, "crash"))
+                               return;
+                            apic_send_IPI_allbutself(NMI_VECTOR);//触发 IPI 中断，让其他 CPU 调 crash_nmi_callback()
                 -> crash_save_cpu(regs, safe_smp_processor_id()) //把 panic CPU 的寄存器信息更新到 crash note
           -> machine_kexec(kexec_crash_image)
              -> local_irq_disable() //关中断了
@@ -765,6 +921,94 @@ static void ident_pmd_init(struct x86_mapping_info *info, pmd_t *pmd_page,
              -> native_gdt_invalidate() //通过指令 lgdt 将全局段寄存器清零
              -> image->start = relocate_kernel((unsigned long)image->head, (unsigned long)page_list, image->start, ...)
   ```
+
+#### 快速切换场景时停止其他 CPU
+* 对于 panic 的场景，需要调用 `crash_save_cpu()` 让各 CPU 将其上下文保存到 vmcore 中的 `NOTE` segment 的名为 `CORE`，类型为 `NT_PRSTATUS` 的字段中去
+* 对于 `kexec -e` 的重启场景，则不需要 `crash_save_cpu()`，只需让其他 CPU 停止运行，然后等待 reboot CPU 切换到新内核
+```c
+kernel_kexec()
+-> machine_shutdown()
+   -> machine_ops.shutdown()
+   => native_machine_shutdown()
+   -> stop_other_cpus() //让其他 CPU 都停下来
+      -> smp_ops.stop_other_cpus(1)
+      => native_stop_other_cpus()
+         -> apic_send_IPI_allbutself(REBOOT_VECTOR) //第一次尝试发 IPI(REBOOT_VECTOR) 的方式，如果尝试失败或超时
+         -> register_stop_handler() //第二次尝试用 NMI DM 的 IPI 尝试让让其他 CPU 停下，回调为 smp_stop_nmi_callback()
+             -> register_nmi_handler(NMI_LOCAL, smp_stop_nmi_callback, NMI_FLAG_FIRST, "smp_stop")
+            for_each_cpu(cpu, &cpus_stop_mask)
+            -> __apic_send_IPI(cpu, NMI_VECTOR)
+-> machine_kexec(kexec_image)
+```
+* 上面已经看到了 `machine_shutdown()` 会做两次尝试，最终都是为了其他 CPU 能最终调用到 `stop_this_cpu()`，最终停止在 `hlt`
+```cpp
+void __noreturn stop_this_cpu(void *dummy)
+{
+...
+    /*
+     * This brings a cache line back and dirties it, but
+     * native_stop_other_cpus() will overwrite cpus_stop_mask after it
+     * observed that all CPUs reported stop. This write will invalidate
+     * the related cache line on this CPU.
+     */
+    cpumask_clear_cpu(cpu, &cpus_stop_mask);
+
+    for (;;) {
+        /*
+         * Use native_halt() so that memory contents don't change
+         * (stack usage and variables) after possibly issuing the
+         * native_wbinvd() above.
+         */
+        native_halt();
+    }
+}
+```
+##### 第一种尝试：`IPI(REBOOT_VECTOR)` 的方式
+* 这种方式比较简单，就是通过发送 `REBOOT_VECTOR` 的 IPI，对应的中断向量如下：
+* arch/x86/kernel/smp.c
+```cpp
+#define REBOOT_VECTOR           0xf8
+/*
+ * this function calls the 'stop' function on all other CPUs in the system.
+ */
+DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
+{
+    apic_eoi();
+    cpu_emergency_disable_virtualization();
+    stop_this_cpu(NULL);
+}
+```
+* arch/x86/kernel/idt.c
+```cpp
+/*
+ * The APIC and SMP idt entries
+ */
+static const __initconst struct idt_data apic_idts[] = {
+...
+#ifdef CONFIG_SMP
+    INTG(RESCHEDULE_VECTOR,         asm_sysvec_reschedule_ipi),
+    INTG(CALL_FUNCTION_VECTOR,      asm_sysvec_call_function),
+    INTG(CALL_FUNCTION_SINGLE_VECTOR,   asm_sysvec_call_function_single),
+    INTG(REBOOT_VECTOR,         asm_sysvec_reboot),
+#endif
+...
+}
+```
+##### 第二种尝试：NMI 的方式
+* `register_stop_handler()` 注册了类型为 `NMI_LOCAL` 的 NMI 回调函数 `smp_stop_nmi_callback()`，`NMI_FLAG_FIRST` 让它最先被 NMI 处理函数执行
+```cpp
+static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
+{
+    /* We are registered on stopping cpu too, avoid spurious NMI */
+    if (raw_smp_processor_id() == atomic_read(&stopping_cpu))
+        return NMI_HANDLED;
+
+    cpu_emergency_disable_virtualization();
+    stop_this_cpu(NULL);
+
+    return NMI_HANDLED;
+}
+```
 
 ### 切换内核
 * `machine_kexec()`调用`relocate_kernel`例程开启了切换内核之旅，传入的参数如下：
@@ -778,16 +1022,16 @@ void machine_kexec(struct kimage *image)
     control_page = page_address(image->control_code_page) + PAGE_SIZE; //指向第二个页面
     memcpy(control_page, relocate_kernel, KEXEC_CONTROL_CODE_MAX_SIZE);//往第二个页面拷贝 relocate_kernel 的代码
 
-    page_list[PA_CONTROL_PAGE] = virt_to_phys(control_page);  // control page 的物理地址
-    page_list[VA_CONTROL_PAGE] = (unsigned long)control_page; // control page 的虚拟地址
+    page_list[PA_CONTROL_PAGE] = virt_to_phys(control_page);  //control page 的物理地址
+    page_list[VA_CONTROL_PAGE] = (unsigned long)control_page; //control page 的虚拟地址
     page_list[PA_TABLE_PAGE] =
-      (unsigned long)__pa(page_address(image->control_code_page)); // 恒等映射页表的物理地址
+      (unsigned long)__pa(page_address(image->control_code_page)); //恒等映射页表的物理地址
 
     if (image->type == KEXEC_TYPE_DEFAULT)
         page_list[PA_SWAP_PAGE] = (page_to_pfn(image->swap_page)
                         << PAGE_SHIFT);
     ...
-    /* now call it */ // 注意，这里执行的是当前内核文本段的 relocate_kernel 例程
+    /* now call it */ //注意，这里执行的是当前内核文本段的 relocate_kernel 例程
     image->start = relocate_kernel((unsigned long)image->head,
                        (unsigned long)page_list,
                        image->start,
@@ -846,52 +1090,52 @@ SYM_CODE_START_NOALIGN(relocate_kernel)
 	pushq %r15
 	pushf       // 将标志寄存器的值压栈
 
-	movq	PTR(VA_CONTROL_PAGE)(%rsi), %r11 // control page 的虚拟地址放到 %r11
-	movq	%rsp, RSP(%r11) // 当前 %rsp 存入 control page 的数据区
-	movq	%cr0, %rax      // %cr0 的值无法直接传输到内存，需借助寄存器中转
-	movq	%rax, CR0(%r11) // 当前 %cr0 存入 control page 的数据区
+	movq	PTR(VA_CONTROL_PAGE)(%rsi), %r11 //control page 的虚拟地址放到 %r11
+	movq	%rsp, RSP(%r11) //当前 %rsp 存入 control page 的数据区
+	movq	%cr0, %rax      //%cr0 的值无法直接传输到内存，需借助寄存器中转
+	movq	%rax, CR0(%r11) //当前 %cr0 存入 control page 的数据区
 	movq	%cr3, %rax
-	movq	%rax, CR3(%r11) // 当前 %cr3 存入 control page 的数据区
+	movq	%rax, CR3(%r11) //当前 %cr3 存入 control page 的数据区
 	movq	%cr4, %rax
-	movq	%rax, CR4(%r11) // 当前 %cr4 存入 control page 的数据区
+	movq	%rax, CR4(%r11) //当前 %cr4 存入 control page 的数据区
 
 	/* Save CR4. Required to enable the right paging mode later. */
-	movq	%rax, %r13      // 当前 %cr4 存一份到 %r13
+	movq	%rax, %r13      //当前 %cr4 存一份到 %r13
 
 	/* zero out flags, and disable interrupts */
-	pushq $0  // 将立即数 0 压栈
-	popfq     // 从栈中弹出数据，加载到标志寄存器；
-    // 刚才压入了 0，所以这里相当于把标志寄存器清零了，包括 IF (Interrupt enable flag) 标志位，所以效果就是关中断
+	pushq $0  //将立即数 0 压栈
+	popfq     //从栈中弹出数据，加载到标志寄存器；
+	//刚才压入了 0，所以这里相当于把标志寄存器清零了，包括 IF (Interrupt enable flag) 标志位，所以效果就是关中断
 	/* Save SME active flag */
 	movq	%r8, %r12  // 第五个参数 sme_active() 传入 %r12
-    // 因为要切换页表了，所以先把需要的关键信息从内存中存到寄存器里
+	//因为要切换页表了，所以先把需要的关键信息从内存中存到寄存器里
 	/*
 	 * get physical address of control page now
 	 * this is impossible after page table switch
 	 */
-	movq	PTR(PA_CONTROL_PAGE)(%rsi), %r8 // control page 的物理地址放到 %r8
+	movq	PTR(PA_CONTROL_PAGE)(%rsi), %r8 //control page 的物理地址放到 %r8
 
 	/* get physical address of page table now too */
-	movq	PTR(PA_TABLE_PAGE)(%rsi), %r9 // 恒等映射页表的物理地址放到 %r9
+	movq	PTR(PA_TABLE_PAGE)(%rsi), %r9 //恒等映射页表的物理地址放到 %r9
 
 	/* get physical address of swap page now */
-	movq	PTR(PA_SWAP_PAGE)(%rsi), %r10 // swap page 的物理地址放到 %r10
+	movq	PTR(PA_SWAP_PAGE)(%rsi), %r10 //swap page 的物理地址放到 %r10
 
 	/* save some information for jumping back */
-	movq	%r9, CP_PA_TABLE_PAGE(%r11) // copy 恒等映射页表的物理地址到 control page 的数据区
-	movq	%r10, CP_PA_SWAP_PAGE(%r11) // copy swap page 的物理地址到 control page 的数据区
-	movq	%rdi, CP_PA_BACKUP_PAGES_MAP(%r11) // copy 页映射备份的起始物理地址到 control page 的数据区
+	movq	%r9, CP_PA_TABLE_PAGE(%r11) //copy 恒等映射页表的物理地址到 control page 的数据区
+	movq	%r10, CP_PA_SWAP_PAGE(%r11) //copy swap page 的物理地址到 control page 的数据区
+	movq	%rdi, CP_PA_BACKUP_PAGES_MAP(%r11) //copy 页映射备份的起始物理地址到 control page 的数据区
 
 	/* Switch to the identity mapped page tables */
-	movq	%r9, %cr3 // 切换页表到恒等映射的页表，和当前运行内核的页表说 byebye 了
-
+	movq	%r9, %cr3 //切换页表到恒等映射的页表，和当前运行内核的页表说 byebye 了
+	//虽然 ret 指令前 %rip 还是高地址段，但 CPU 实际上是从映射到了 control page 中的物理地址去取指令了
 	/* setup a new stack at the end of the physical control page */
-	lea	PAGE_SIZE(%r8), %rsp // 设置 control page 的页结束的物理地址为新的栈底
+	lea	PAGE_SIZE(%r8), %rsp //设置 control page 的页结束的物理地址为新的栈底
 
 	/* jump to identity mapped page */
-	addq	$(identity_mapped - relocate_kernel), %r8 // control page 的起始 PA + relocate_kernel 的长度 = identity_mapped 例程的物理地址
-	pushq	%r8 // identity_mapped 例程的物理地址入新的栈
-	ret         // 相当于把 identity_mapped 例程的物理地址弹出到 %rip，调用 identity_mapped 例程，这一跳转，%rip 里的值就变成恒等映射的虚拟地址了
+	addq	$(identity_mapped - relocate_kernel), %r8 //control page 的起始 PA + relocate_kernel 的长度 = identity_mapped 例程的物理地址
+	pushq	%r8 //identity_mapped 例程的物理地址入新的栈
+	ret         //相当于把 identity_mapped 例程的物理地址弹出到 %rip，调用 identity_mapped 例程，这一跳转，%rip 里的值就变成恒等映射的虚拟地址了
 SYM_CODE_END(relocate_kernel)
 
 SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
@@ -899,7 +1143,7 @@ SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
 	/* set return address to 0 if not preserving context */
 	pushq	$0
 	/* store the start address on the stack */
-	pushq   %rdx // kimage->start 为重定位到 “Crash kernel” region 后的`purgatory_start`例程的物理地址
+	pushq   %rdx // kimage->start 为重定位到 “Crash kernel” region 后的 purgatory_start 例程的物理地址
 
 	/*
 	 * Set cr0 to a known state:   设置 cr0 控制寄存器为一个已知状态
@@ -912,8 +1156,8 @@ SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
 	 */
 	movq	%cr0, %rax
 	andq	$~(X86_CR0_AM | X86_CR0_WP | X86_CR0_TS | X86_CR0_EM), %rax
-	orl	$(X86_CR0_PG | X86_CR0_PE), %eax // 开启分页机制，PE 和 PG 标志都要置位
-	movq	%rax, %cr0 // 载入定制好的 cr0 状态
+	orl	$(X86_CR0_PG | X86_CR0_PE), %eax //开启分页机制，PE 和 PG 标志都要置位
+	movq	%rax, %cr0                   //载入定制好的 cr0 状态
 
 	/*
 	 * Set cr4 to a known state:
@@ -921,30 +1165,30 @@ SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
 	 *  - 5-level paging, if it was enabled before
 	 */
 	movl	$X86_CR4_PAE, %eax
-	testq	$X86_CR4_LA57, %r13 // 旧 %cr4 曾存了一份到 %r13，测试原来 5 级页表是否开启？
-	jz	1f // 未曾开启 5 级页表，跳转到标号 1
-	orl	$X86_CR4_LA57, %eax // 曾开启了 5 级页表，保持开启
+	testq	$X86_CR4_LA57, %r13 //旧 %cr4 曾存了一份到 %r13，测试原来 5 级页表是否开启？
+	jz	1f                      //未曾开启 5 级页表，跳转到标号 1
+	orl	$X86_CR4_LA57, %eax     //曾开启了 5 级页表，保持开启
 1:
-	movq	%rax, %cr4 // 载入定制好的 cr4 状态控制寄存器
+	movq	%rax, %cr4          //载入定制好的 cr4 状态控制寄存器
 
-	jmp 1f
+	jmp 1f                      //这个跳转大有玄机，见下面详解
 1:
 
 	/* Flush the TLB (needed?) */
-	movq	%r9, %cr3 // 通过再次加载恒等映射页表到 %cr3 的方式刷新 TLB，不想用处理器相关指令
+	movq	%r9, %cr3 //通过再次加载恒等映射页表到 %cr3 的方式刷新 TLB，不想用处理器相关指令
 
 	/*
 	 * If SME is active, there could be old encrypted cache line
 	 * entries that will conflict with the now unencrypted memory
 	 * used by kexec. Flush the caches before copying the kernel.
 	 */
-	testq	%r12, %r12 // 测试第五个参数 sme_active()
-	jz 1f // 未激活，跳转到标号 1
+	testq	%r12, %r12 //测试第五个参数 sme_active()
+	jz 1f              //未激活，跳转到标号 1
 	wbinvd
 1:
 
-	movq	%rcx, %r11 // image->preserve_context 传到 %r11
-	call	swap_pages // 调用 swap_pages 例程
+	movq	%rcx, %r11 //image->preserve_context 传到 %r11
+	call	swap_pages //调用 swap_pages 例程
 
 	/*
 	 * To be certain of avoiding problems with self-modifying code
@@ -953,15 +1197,15 @@ SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
 	 * and not processor dependent.
 	 */
 	movq	%cr3, %rax
-	movq	%rax, %cr3 // 刷 TLB，不想用处理器相关的指令
+	movq	%rax, %cr3 //刷 TLB，不想用处理器相关的指令
 
 	/*
 	 * set all of the registers to known values
 	 * leave %rsp alone
 	 */
 
-	testq	%r11, %r11 // %r11 存的是 image->preserve_context 的值
-	jnz 1f             // 想保留上下文，向前跳到标号 1，跳过以下寄存器清零操作
+	testq	%r11, %r11 //%r11 存的是 image->preserve_context 的值
+	jnz 1f             //想保留上下文，向前跳到标号 1，跳过以下寄存器清零操作
 	xorl	%eax, %eax
 	xorl	%ebx, %ebx
 	xorl    %ecx, %ecx
@@ -977,8 +1221,8 @@ SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
 	xorl	%r13d, %r13d
 	xorl	%r14d, %r14d
 	xorl	%r15d, %r15d
-    // 还记得上面曾把重定位到 “Crash kernel” region 后的`purgatory_start`例程的物理地址放到栈上了吗？
-	ret // 通过这条指令我们跳到了 “Crash kernel” region 里的当时用户态构造好的 purgatory_start
+	//还记得上面曾把重定位到 “Crash kernel” region 后的 purgatory_start 例程的物理地址放到栈上了吗？
+	ret //通过这条指令我们跳到了 “Crash kernel” region 里的当时用户态构造好的 purgatory_start
 
 1:
 	popq	%rdx
@@ -1024,31 +1268,31 @@ SYM_CODE_END(virtual_mapped)
 	/* Do the copies */
 SYM_CODE_START_LOCAL_NOALIGN(swap_pages)
 	UNWIND_HINT_EMPTY
-	movq	%rdi, %rcx 	/* Put the page_list in %rcx */ // image->head 传到 %rcx
-	xorl	%edi, %edi  // 清零 %edi
-	xorl	%esi, %esi  // 清零 %esi，即已失效的 page_list 虚拟地址
-	jmp	1f              // 向前跳到标号 1
+	movq	%rdi, %rcx 	/* Put the page_list in %rcx */ //image->head 传到 %rcx
+	xorl	%edi, %edi  //清零 %edi
+	xorl	%esi, %esi  //清零 %esi，即已失效的 page_list 虚拟地址
+	jmp	1f              //向前跳到标号 1
 
 0:	/* top, read another word for the indirection page */
 
 	movq	(%rbx), %rcx
 	addq	$8,	%rbx
 1:
-	testb	$0x1,	%cl   /* is it a destination page? */ // panic case 该测试失败
-	jz	2f                // 向前跳到标号 2
+	testb	$0x1,	%cl   /* is it a destination page? */ //panic case 该测试失败
+	jz	2f                //向前跳到标号 2
 	movq	%rcx,	%rdi
-	andq	$0xfffffffffffff000, %rdi // 低 12 位清零
+	andq	$0xfffffffffffff000, %rdi //低 12 位清零
 	jmp	0b
 2:
-	testb	$0x2,	%cl   /* is it an indirection page? */ // panic case 该测试失败
-	jz	2f                // 向前跳到下一个标号 2
+	testb	$0x2,	%cl   /* is it an indirection page? */ //panic case 该测试失败
+	jz	2f                //向前跳到下一个标号 2
 	movq	%rcx,   %rbx
 	andq	$0xfffffffffffff000, %rbx
 	jmp	0b
 2:
-	testb	$0x4,	%cl   /* is it the done indicator? */ // panic case 该测试成功，回忆 kimage_terminate()
-	jz	2f                // 测试失败会向前跳到下一个标号 2
-	jmp	3f                // 测试成功向前跳到标号 3
+	testb	$0x4,	%cl   /* is it the done indicator? */ //panic case 该测试成功，回忆 kimage_terminate()
+	jz	2f                //测试失败会向前跳到下一个标号 2
+	jmp	3f                //测试成功向前跳到标号 3
 2:
 	testb	$0x8,	%cl   /* is it the source indicator? */
 	jz	0b	      /* Ignore it otherwise */
@@ -1075,7 +1319,7 @@ SYM_CODE_START_LOCAL_NOALIGN(swap_pages)
 	lea	PAGE_SIZE(%rax), %rsi
 	jmp	0b
 3:
-	ret // 返回 identity_mapped 例程
+	ret     //返回 identity_mapped 例程
 SYM_CODE_END(swap_pages)
 
 	.globl kexec_control_code_size
@@ -1093,6 +1337,27 @@ SYM_CODE_END(swap_pages)
 > 如果任务从没有使用过协处理器，那么相应协处理器上下文就不用保存。
 
 * 这里面多次先把要调用的函数`push`到栈上，再用`ret`指令跳转的方式完成函数调用，而不是用`call`指令。我能想到的原因是`call`指令需要把下一条指令压栈作为将来的返回地址，然而我们这用`ret`调用的方式大多是不需要返回的，所以用这样的方式能保持栈的干净。而为什么不是`jmp`指令呢？是因为要跳转的地址都是动态的吗？
+
+#### 向前跳转 `jmp 1f` 到下一字节
+* 在 `identity_mapped` 例程中有一个怪异的跳转，向前跳转 `jmp 1f` 到下一字节
+```asm
+SYM_CODE_START_LOCAL_NOALIGN(identity_mapped)
+...
+	jmp 1f
+1:
+```
+* Andrew Cooper 在 [这里](https://lore.kernel.org/lkml/55bc0649-c017-49ab-905d-212f140a403f@citrix.com/) 对它进行了解释：
+
+> * `jmp 1f` 可以追溯到古老的 8086，它开创了指令指针只是 ISA 想象出来的趋势[^1]
+> * 硬件维护指向下一个要获取的字节的指针（预取队列最多 `6` 个字节），并且有一个微操作可以从累加器中减去预取队列的当前长度。
+> * 在那些日子里，预取队列与主内存不一致，并且跳转（指令流中的不连续性）只是刷新了预取队列。
+> * 在修改可执行代码后，这是必要的，因为否则你最终可能会执行预取队列中的陈旧的字节，然后执行非陈旧的字节。（也称为区分 8086 和 8088 的方法，因为后者只有 `4` 字节预取队列。）
+> * 无论如何。这是在该术语进入体系结构之前你用来拼写“序列化操作”的方式。Linux 仍然支持 Pentium 之前的 CPU，因此仍然需要关注 486 中的预取队列。
+> * 但是，此示例似乎是 64 位代码，并且跟在一个对 `CR4` 的写入之后，这将完全序列化，因此它可能是从 32 位代码复制粘贴的，原则上这是必要的。
+
+* [^1][8086 专利](https://patents.google.com/patent/US4449184A) 描述了 8086 中的程序计数器如何不保存“真实”值：
+
+> `PC` is not a real or true program counter in that it does not, nor does any other register within CPU, maintain the actual execution point at any time. `PC` actually points to the next byte to be input into queue. The real program counter is calculated by instruction whenever a relative `jump` or `call` is required by subtracting the number of accessed instructions still remaining unused in queue from `PC`.
 
 ## vmcoreinfo
 ### 分配 vmcoreinfo 空间

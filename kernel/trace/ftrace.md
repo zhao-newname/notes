@@ -24,30 +24,30 @@
 ## function tracer
 
 #### 设定函数跟踪器
-```
+```sh
 echo 0 > /sys/kernel/debug/tracing/tracing_on
 echo function > /sys/kernel/debug/tracing/current_tracer
 ```
 
 #### 设定跟踪特定的函数
-```
+```sh
 echo do_page_fault > /sys/kernel/debug/tracing/set_ftrace_filter
 ```
 * 当然可以不设置，那样会跟踪所有能跟踪的函数。
 
 #### 指定跟踪特定的CPU
-```
+```sh
 echo "cpu-id" > /sys/kernel/debug/tracing/tracing_cpumask
 ```
 
 #### 开始跟踪
-```
+```sh
 echo 1 > /sys/kernel/debug/tracing/tracing_on
 cat /sys/kernel/debug/tracing/trace_pipe | tee /tmp/ftrace.log
 ```
 
 #### 输出示例
-```
+```c
             TASK-PID CPU irqs-off need-resched hardirq/softirq preempt-depth delay TIMESTAMP FUNCTION
             lttng-879   [000] d..1 2437395.004331: do_page_fault <-do_PrefetchAbort
             lttng-879   [000] d..1 2437395.004331: do_page_fault <-do_PrefetchAbort
@@ -57,7 +57,7 @@ cat /sys/kernel/debug/tracing/trace_pipe | tee /tmp/ftrace.log
 ```
 
 #### 关闭跟踪
-```
+```sh
 echo 0 > /sys/kernel/debug/tracing/tracing_on
 echo nop > /sys/kernel/debug/tracing/current_tracer
 ```
@@ -76,25 +76,25 @@ echo nop > /sys/kernel/debug/tracing/current_tracer
 
 ## function_graph tracer
 #### 设定函数跟踪器
-```
+```sh
 echo 0 > /sys/kernel/debug/tracing/tracing_on
 echo function_graph > /sys/kernel/debug/tracing/current_tracer
 ```
 
 #### 设定跟踪特定的进程
-```
+```sh
 echo 822 > /sys/kernel/debug/tracing/set_ftrace_pid
 ```
 * 当然可以不设置，那样会跟踪所有能跟踪的进程。
 
 #### 开始跟踪
-```
+```sh
 echo 1 > /sys/kernel/debug/tracing/tracing_on
 cat /sys/kernel/debug/tracing/trace_pipe | tee /tmp/ftrace.log
 ```
 
 #### 输出示例
-```
+```c
 # tracer: function_graph
 #
 # CPU  DURATION                  FUNCTION CALLS
@@ -205,7 +205,7 @@ cat /sys/kernel/debug/tracing/trace_pipe | tee /tmp/ftrace.log
 	echo 1 > /proc/sys/kernel/stack_tracer_enabled
 	```
 * 从此，ftrace 便留心记录内核函数的堆栈使用。 Max Stack Tracer 的输出在 stack_trace 文件中：
-	```
+	```c
 	# cat /sys/kernel/debug/tracing/stack_trace
 	        Depth    Size   Location    (25 entries)
 	        -----    ----   --------
@@ -250,7 +250,7 @@ git://git.kernel.org/pub/scm/linux/kernel/git/rostedt/trace-cmd.git
 * [trace-cmd(1) - Linux manual page](http://man7.org/linux/man-pages/man1/trace-cmd.1.html)
 ### 功能
 #### trace-cmd
-```
+```sh
 $ trace-cmd -h
 
 trace-cmd version 2.3.1
@@ -277,7 +277,7 @@ usage:
      check-events - parse trace event formats
 ```
 #### trace-cmd record
-```c
+```sh
 $ trace-cmd record -h
 
 trace-cmd version 2.3.1
@@ -469,14 +469,14 @@ cpus=8
 ...
 ```
 * 对应的 ftrace 操作
-	```
-	# echo ip_rcv > /sys/kernel/debug/tracing/set_graph_function
-	# echo function_graph > /sys/kernel/debug/tracing/current_tracer
-	# echo 1 > /sys/kernel/debug/tracing/tracing_on
-	# cat /sys/kernel/debug/tracing/trace_pipe
-	# echo 0 > /sys/kernel/debug/tracing/tracing_on
-	# echo nop > /sys/kernel/debug/tracing/current_tracer
-	```
+```sh
+echo ip_rcv > /sys/kernel/debug/tracing/set_graph_function
+echo function_graph > /sys/kernel/debug/tracing/current_tracer
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+cat /sys/kernel/debug/tracing/trace_pipe
+echo 0 > /sys/kernel/debug/tracing/tracing_on
+echo nop > /sys/kernel/debug/tracing/current_tracer
+```
 
 ### 图形前端-kernelshark
 * [KernelShark](http://rostedt.homelinux.com/kernelshark/)
@@ -485,36 +485,37 @@ cpus=8
 # 跟踪选项
 ## 通用 trace_options
 * `/sys/kernel/debug/tracing/trace_options`文件
-	```
+	```sh
 	# cat /sys/kernel/debug/tracing/trace_options
-	print-parent
-	nosym-offset
-	nosym-addr
-	noverbose
-	noraw
-	nohex
-	nobin
-	noblock
-	nostacktrace
-	trace_printk
-	noftrace_preempt
-	nobranch
-	annotate
-	nouserstacktrace
-	nosym-userobj
-	noprintk-msg-only
-	context-info
-	nolatency-format
-	sleep-time
-	graph-time
-	record-cmd
-	overwrite
-	nodisable_on_free
-	irq-info
-	markers
-	function-trace
-	notest_nop_accept
-	notest_nop_refuse
+  print-parent
+  nosym-offset
+  nosym-addr
+  noverbose
+  noraw
+  nohex
+  nobin
+  noblock
+  nofields
+  trace_printk
+  annotate
+  nouserstacktrace
+  nosym-userobj
+  noprintk-msg-only
+  context-info
+  latency-format
+  record-cmd
+  norecord-tgid
+  overwrite
+  nodisable_on_free
+  irq-info
+  markers
+  noevent-fork
+  pause-on-trace
+  hash-ptr
+  function-trace
+  nofunction-fork
+  display-graph
+  nostacktrace
 	```
 * 通过修改`/sys/kernel/debug/tracing/options`下的文件可以使能这些`trace_options`
 
@@ -558,11 +559,15 @@ cpus=8
 	```
 
 ### function-trace
-* 如果该选项使能（缺省情况），延迟型 tracer 会启用函数跟踪功能
+* 如果该选项使能（缺省情况），延迟型 tracer 会启用函数跟踪功能（栈回溯）
 * 当禁用该选项时，延迟型 tracer 不跟踪函数，从而降低执行延迟测试时的开销
 
 ### stacktrace
 * 当启用该选项时，任何 **trace event** 的栈跟踪将会被记录下来
+
+### display-graph
+* 设置后，延迟 tracer（irqsoff、wakeup 等）将使用 function graph tracing 而不是 function tracing。
+* 建议采用 latency tracers 时设置该选项
 
 ## function tracer 选项
 ### func_stack_trace
@@ -572,7 +577,7 @@ cpus=8
 * 当设置该 option 时，每个函数被记录的时候，它的栈跟踪也会被记录
 * **NOTE:** 在使能该选项时，务必同时设置`set_ftrace_filter`，否则系统性能会严重下降。并且在清除过滤函数的时候记得关闭该选项。
 #### Example:
-```
+```sh
 $ echo rtc_timer_enqueue > /sys/kernel/debug/tracing/set_ftrace_filter
 $ echo function > /sys/kernel/debug/tracing/current_tracer
 $ echo 1 > /sys/kernel/debug/tracing/options/func_stack_trace
@@ -590,8 +595,12 @@ rtc_test.2029-2902  [001] ....  7694.642015: <stack trace>
 #### `function-trace` vs `stacktrace` vs `func_stack_trace`
 * `function-trace`、`stacktrace`、`func_stack_trace`三者都可以用于栈跟踪，但适用场景是不同的
   * `function-trace`主要用于 **延迟型 tracer**，例如`irqsoff`、`preemptoff`和`preemptirqsoff`
+    * kernel command line：`trace_options=function-trace ftrace=preemptoff`
   * `stacktrace`主要用于 **trace event**，也就是预设好的跟踪点
+    * kernel command line eg：`trace_options=stacktrace trace_event=[event-list] trace_trigger="sched_switch.stacktrace if prev_state == 2"`
   * `func_stack_trace`主要用于 **function tracer**，用于自定义要跟踪的函数（配合`set_ftrace_filter`）
+    * kernel command line eg.1：`trace_options=func_stack_trace ftrace=function ftrace_filter=[function-list]`
+    * kernel command line eg.2：`trace_options=func_stack_trace ftrace=function_graph ftrace_graph_filter=[function-list]`
 
 ## function_graph tracer 选项
 ### funcgraph-proc
@@ -600,6 +609,12 @@ rtc_test.2029-2902  [001] ....  7694.642015: <stack trace>
 * `funcgraph-irqs`：当禁用时，发生在中断上下文的函数不会被跟踪
 ### sleep-time
 * `sleep-time`：当使能时，会把任务被调度出去的时间也算作函数调用的一部份。
+### funcgraph-retval
+* 设置后，每个跟踪函数的返回值将在等号“`=`”后打印。默认情况下，此功能处于关闭状态。
+### funcgraph-retval-hex
+* 设置后，返回值将始终以十六进制格式打印。
+* 如果未设置此选项且返回值为错误代码，则将以有符号十进制格式打印；否则也将以十六进制格式打印。
+* 默认情况下，此选项处于关闭状态。
 
 # 基于 kprobes 的事件跟踪
 * 与基于 tracepoint 的事件跟踪相似，kprobes 事件跟踪是基于 kprobes 点的跟踪
@@ -640,13 +655,13 @@ FETCHARGS | 探测点的参数，每个探测点可以有最多 128 个参数
 ---------------|-----
 `%REG`         | 获取寄存器`REG`的值
 `@ADDR`        | 获取内存地址`ADDR`处的值（`ADDR`应处于内核地址空间）
-`@SYM[+|-offs]`| 获取符号偏移`SYM +|- offs`的值（`SYM`应为数据符号）
+`@SYM[+\|-offs]`| 获取符号偏移`SYM +\|- offs`的值（`SYM`应为数据符号）
 `$stackN`      | 获取栈上的第 N 个条目（N >= 0）
 `$stack`       | 获取栈顶的地址
 `$argN`        | 获取函数的第 N 个参数（仅用于安置在函数上的探针）
 `$retval`      | 获取函数的返回值（仅用于 *返回探针*）
 `$comm`        | 获取当前进程的名字
-`+|-[u]OFFS(FETCHARG)`| 获取 FETCHARG 偏移 `+|- OFFS` 地址处的值（可用于获取数据结构的域；`u`表示用户空间的解引用）
+`+\|-[u]OFFS(FETCHARG)`| 获取 FETCHARG 偏移 `+\|- OFFS` 地址处的值（可用于获取数据结构的域；`u`表示用户空间的解引用）
 `\IMM`         | 将立即数存入参数
 `NAME=FETCHARG`| 将`NAME`设置为 FETCHARG 的参数名
 `FETCHARG:TYPE`| 将 FETCHARG 的类型设置为`TYPE`
@@ -815,5 +830,7 @@ echo '-:dosysopen1' > /sys/kernel/debug/tracing/kprobe_events
 * [Debugging the kernel using Ftrace - part 1](https://lwn.net/Articles/365835/)
 * [Debugging the kernel using Ftrace - part 2](https://lwn.net/Articles/366796/)
 * [Secrets of the Ftrace function tracer](https://lwn.net/Articles/370423/)
-* [Kprobe-based Event Tracing — The Linux Kernel documentation](https://www.kernel.org/doc/html/latest/trace/kprobetrace.html)
+* [ftrace - Function Tracer — The Linux Kernel documentation](https://www.kernel.org/doc/html/latest/trace/ftrace.html)
+* [Event Tracing — The Linux Kernel documentation](https://www.kernel.org/doc/html/latest/trace/events.html)
 * [Kernel Probes (Kprobes) — The Linux Kernel documentation](https://www.kernel.org/doc/html/latest/trace/kprobes.html)
+* [Kprobe-based Event Tracing — The Linux Kernel documentation](https://www.kernel.org/doc/html/latest/trace/kprobetrace.html)

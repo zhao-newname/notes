@@ -102,7 +102,9 @@
 	...*```
 	```
 
-## 抢占计数preempt_count
+## 抢占计数 preempt_count
+
+![Preempt Count](pic/preemt_count.png)
 
 * `preempt_count_add()`和`preempt_count_sub()`调用可重载的`__preempt_count_add()`和`__preempt_count_sub()`
 * 目前就x86重载`__preempt_count_add()`和`__preempt_count_sub()`的实现
@@ -180,7 +182,7 @@
 	...*```
 	```
 
-### x86的preempt_count
+### x86 的 preempt_count
 * x86的`thread_info`结构里并没有`preempt_count`成员，而是通过Per-CPU变量`__preempt_count`存储的。
 * arch/x86/include/asm/thread_info.h
 	```c
@@ -227,10 +229,10 @@
 	{
 	    raw_cpu_add_4(__preempt_count, -val);
 	}
-	...__```
+	...
 	```
 
-### ARM的preempt_count
+### ARM 的 preempt_count
 * ARM的`thread_info`结构有`preempt_count`成员，这和x86的不一样。
 * arch/arm/include/asm/thread_info.h
 	```c
@@ -377,11 +379,11 @@ retint_kernel:
 #ifdef CONFIG_PREEMPT
         /* Interrupts are off */
         /* Check if we need preemption */
-        bt      $9, EFLAGS(%rsp)                /* were interrupts off? */
-        jnc     1f  /*检查CF，中断是否关闭。如果CF=0，中断未关闭，则前跳至1，不抢占；否则往下执行*/
+        bt      $9, EFLAGS(%rsp)  /* were interrupts off? */ /*测试 EFLAGS 的 bit 9，即 IF 的值存入 CF*/
+        jnc     1f  /*检查 CF 即检查 IF，中断是否关闭。如果 CF=0，表示中断关闭，则前跳至 1，不抢占；否则往下执行*/
 0:      cmpl    $0, PER_CPU_VAR(__preempt_count)
-        jnz     1f  /*检查上面比较结果是否不为0。如果不为0，抢占是关闭状态，则前跳至1，不抢占；否则抢占发生*/
-        call    preempt_schedule_irq /*中断关闭状态下调用函数preempt_schedule_irq()*/
+        jnz     1f  /*检查上面比较结果是否不为 0。如果不为 0，抢占是关闭状态，则前跳至 1，不抢占；否则抢占发生*/
+        call    preempt_schedule_irq /*中断关闭状态下调用函数 preempt_schedule_irq()*/
         jmp     0b
 1:
 #endif
@@ -530,3 +532,6 @@ resume_kernel:
 	        exception_exit(prev_state);
 	}
 	```
+
+# References
+* [Revisiting the kernel's preemption model, part 2 - LWN](https://lwn.net/Articles/945422/)

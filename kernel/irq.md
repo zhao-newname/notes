@@ -1,6 +1,9 @@
 # 中断
 
 ## Interrupt Descriptor Table (IDT)
+
+![Relationship of the IDTR and IDT](pic/idtr-idt.png)
+
 * 中断描述符表 Interrupt Descriptor Table (IDT) 与每个中断和异常向量关联
 * 每个表项是一个 8 字节的描述符，x86 有 256 个中断向量，因此需要 256 x 8 = 2048 字节来存储 IDT
 * `idtr`寄存器允许 IDT 被加载到内存中的任何位置
@@ -26,6 +29,8 @@
 
 ## x86的中断和异常的硬件处理
 
+![Interrupt Procedure Call](pic/intr-call.png)
+
 * 假设内核已经初始化并且 CPU 运行在保护模式
 * 在执行完一条指令之后，`cs`和`eip`寄存器会包含将要执行的下一条指令的逻辑地址
 * 在处理这条指令之前，CPU 控制单元会检查在执行上一条指令期间是否有中断或异常发生，如果有，CPU 控制单元会完成下列操作
@@ -37,7 +42,7 @@
   4. 确保发出中断/异常的来源是合法的
       - 比较存储在`cs`寄存器最后两位的 Current Privilege Level (CPL) 和 GDT 表中的段描述符的 Descriptor Privilege Level (DPL)。
       - 如果 CPL 比 DPL 低，产生一个 “General protection” 的异常，因为中断处理函数的特权级不能低于比引起中断的程序的特权级。
-      - 例如，只有在硬件中断发生时，CPU 特权级提升（到 0 级）后才能跳转到去执行中断处理代码，因此不会做此检查。而系统调用发生在用户态，因为系统调用所使用的陷阱门的 DPL=3，因此 CPL 为任何特权级的代码都可以发出系统调用。
+      - 例如，**只有在硬件中断发生时，CPU 特权级提升（到 0 级）后才能跳转到去执行中断处理代码，因此不会做此检查**。而系统调用发生在用户态，因为系统调用所使用的陷阱门的 DPL=3，因此 CPL 为任何特权级的代码都可以发出系统调用。
       - 对于编程异常，作进一步的安全检查：比较 CPL 和 IDT 表中的门描述符的 DPL，如果 DPL 比 CPL 低，产生一个 “General protection” 异常。
       - 因为要跳转到的目标代码（中断代码）优先级需要高于或等于被打断的代码（比如用户态的代码）
       - 第二个检查阻止了用户应用程序通过高优先级的陷阱门或中断门，只能通过低优先级的陷阱门（系统门和系统中断门）
@@ -50,9 +55,12 @@
   8. 如果异常带有硬件错误码，也将它保存到栈上
   9. 根据 IDT 第 i 项的门描述符中的 *段选择符* 和 *偏移*，将中断或异常 handler 第一条指令的逻辑地址加载地址到`cs`和`eip`
 
+* x86-32 位模式 CPU 的异常处理对栈的使用
+![Stack Usage on Transfers to Interrupt and Exception-Handling Routines](pic/x86_stack_irq_exp.png)
+
 ## 中断初始化
 ### Call trace
-```c
+```cpp
 start_kernel()
 -> trap_init()
   -> idt_setup_traps()
@@ -64,6 +72,7 @@ start_kernel()
         -> load_idt((const struct desc_ptr *)&idt_descr);
            -> native_load_idt()
   -> idt_setup_ist_traps()
+     -> idt_setup_from_table(idt_table, ist_idts, ARRAY_SIZE(ist_idts), true)
   -> x86_init.irqs.trap_init()
   -> idt_setup_debugidt_traps()
 -> init_IRQ()
@@ -71,21 +80,23 @@ start_kernel()
   => native_init_IRQ()
      -> idt_setup_apic_and_irq_gates()
         -> idt_setup_from_table(idt_table, apic_idts, ARRAY_SIZE(apic_idts), true);
-        -> int i = FIRST_EXTERNAL_VECTOR;
-           for_each_clear_bit_from(i, system_vectors, FIRST_SYSTEM_VECTOR)
-              set_intr_gate(i, irq_entries_start + 8 * (i - FIRST_EXTERNAL_VECTOR));
+        -> int i = FIRST_EXTERNAL_VECTOR; // 第一个外部中断向量，0x20
+           for_each_clear_bit_from(i, system_vectors, FIRST_SYSTEM_VECTOR) {
+              entry = irq_entries_start + IDT_ALIGN * (i - FIRST_EXTERNAL_VECTOR);
+              set_intr_gate(i, entry);
+           }
 ```
 * `idt_table`为设置好内容的 **IDT 表**
 * `idt_descr`为存储 IDT 表地址的指针，用`lidt`指令将它加载到`idtr`寄存器
 * `def_idts[]`为通用的异常数组，`apic_idts[]`为 x86 APIC 的中断数组
 * x86 通过`native_init_IRQ()`调用`idt_setup_apic_and_irq_gates()`设置好 APIC 和 **中断** 的门
   * 对于中断来说，`irq_entries_start`就是软件在中断处理的第一段例程
-  * `irq_entries_start`见 arch/x86/entry/entry_64.S，里面包含一个很大的汇编宏展开`.rept (FIRST_SYSTEM_VECTOR - FIRST_EXTERNAL_VECTOR)`
+  * `irq_entries_start`见 arch/x86/include/asm/idtentry.h，里面包含一个很大的汇编宏展开`.rept (FIRST_SYSTEM_VECTOR - FIRST_EXTERNAL_VECTOR)`
 
 ### `def_idts[]`数组
 * `struct gate_struct`对应到 Intel IDT 的表项，存储格式见上面图示，注意，中断处理函数的地址不是连续存储的，而是被`offset_low`，`offset_middle`，`offset_high`分成三个部分
   * arch/x86/include/asm/desc_defs.h
-  ```c
+  ```cpp
   enum {  //对应到表示门描述符类型的 40-43 位
           GATE_INTERRUPT = 0xE,
           GATE_TRAP = 0xF,
@@ -94,7 +105,7 @@ start_kernel()
   };
   ...
   struct idt_bits {
-          u16             ist     : 3, //32-34 位
+          u16             ist     : 3, //32-34 位，interrupt stack table 索引
                           zero    : 5, //35-39 位为 0
                           type    : 5, //40-43 位为门描述符类型，44 为 0
                           dpl     : 2, //45-46 位为门描述符 DPL
@@ -116,7 +127,7 @@ start_kernel()
   ```
 * 0~32 号异常的枚举定义
   * arch/x86/include/asm/traps.h
-  ```c
+  ```cpp
   /* Interrupts/Exceptions */
   enum {
           X86_TRAP_DE = 0,        /*  0, Divide-by-zero */
@@ -144,7 +155,7 @@ start_kernel()
   ```
 * `def_idts[]`数组存储的 Linux 中断向量与中断处理函数的对应关系，这与 Intel IDT 表`idt_table[]`是不同的，尤其是 Intel IDT 表项中存的是 **段选择符** 和 **偏移**，因此需要在`idt_init_desc()`函数中进行格式转换
 * arch/x86/kernel/idt.c
-  ```c
+  ```cpp
   struct idt_data {
           unsigned int    vector;
           unsigned int    segment;
@@ -232,25 +243,24 @@ start_kernel()
   ...*```
   ```
 * 例如，对于`X86_TRAP_NMI`，在IDT 数组`def_idts[]`的第二个元素
-  ```c
+  ```cpp
   struct idt_data def_idts[1] =
   {
           .vector         = X86_TRAP_NMI,   //第二号中断向量
-          .bits.ist       = DEFAULT_STACK,
+          .bits.ist       = DEFAULT_STACK,  //用于中断栈表的索引
           .bits.type      = GATE_INTERRUPT, //门描述符的 40-43 位
           .bits.dpl       = DPL0,           //门描述符的 45~46 位
           .bits.p         = 1,              //门描述符的 47 位
           .addr           = nmi,
           .segment        = __KERNEL_CS,
   }
-  ...__```
   ```
 * 其中，`X86_TRAP_NMI`向量的中断处理函数的入口地址为`nmi`，例如在 x86-64 中的定义见`arch/x86/entry/entry_64.S`中的`ENTRY(nmi)`
   * 该中断处理函数的入口地址会在`idt_init_desc()`函数中被分为`offset_low`（16 bit）、`offset_middle`（16 bit）、`offset_high`（32 bit）三段存储
 * 其他的一些中断向量的入口函数可能会用类似`idtentry invalid_op do_invalid_op has_error_code=0`的汇编宏`.macro idtentry sym do_sym has_error_code:req paranoid=0 shift_ist=-1`来实现
 * x86 填充 Intel IDT 表，加载 IDT 表的实现
   * arch/x86/include/asm/desc.h
-  ```c
+  ```cpp
   #ifdef CONFIG_PARAVIRT
   #include <asm/paravirt.h>
   #else
@@ -274,7 +284,7 @@ start_kernel()
   ```
 * `idt_descr` 初始值为`idt_table[]`的起始地址，在`trap_init()`中会被改写
 * arch/x86/kernel/idt.c
-  ```c
+  ```cpp
   /* Must be page-aligned because the real IDT is used in a fixmap. */
   gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
 
@@ -320,12 +330,12 @@ start_kernel()
   ```
 * 数组`def_idts[]`中的向量都会在`system_vectors`位图中设置相应的位
 * arch/x86/kernel/traps.c
-  ```c
+  ```cpp
   DECLARE_BITMAP(system_vectors, NR_VECTORS);
   ```
 * `__ro_after_init`是编译器属性，定义如下
 * include/linux/cache.h
-  ```c
+  ```cpp
   /*
    * __ro_after_init is used to mark things that are read-only after init (i.e.
    * after mark_rodata_ro() has been called). These are effectively read-only,
@@ -337,7 +347,7 @@ start_kernel()
   ```
 ### 加载IDT
 * arch/x86/include/asm/pgtable_64_types.h
-  ```c
+  ```cpp
   /*
    * 4th level page in 5-level paging case
    */
@@ -347,7 +357,7 @@ start_kernel()
   #define CPU_ENTRY_AREA_BASE     (CPU_ENTRY_AREA_PGD << P4D_SHIFT) //0xfffffe0000000000
   ```
 * arch/x86/include/asm/cpu_entry_area.h
-  ```c
+  ```cpp
   #define CPU_ENTRY_AREA_RO_IDT           CPU_ENTRY_AREA_BASE //0xfffffe0000000000
   ...
   #define CPU_ENTRY_AREA_RO_IDT_VADDR     ((void *)CPU_ENTRY_AREA_RO_IDT)  //0xfffffe0000000000
@@ -358,7 +368,7 @@ start_kernel()
   * `pfn_pte(unsigned long page_nr, pgprot_t pgprot)` 根据输入的 Page Frame Number 和 Page Flags 转为 `pte_t` 类型的值（`.val`当然是物理地址）
   * `set_pte_vaddr(unsigned long vaddr, pte_t pteval)` 会根据输入的虚拟地址层层往下直至找到 PTE，把值设为传入的`pte_t pteval`
 * arch/x86/mm/cpu_entry_area.c
-  ```c
+  ```cpp
   void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
   {
           unsigned long va = (unsigned long) cea_vaddr;
@@ -369,7 +379,7 @@ start_kernel()
 * `load_idt()`在非半虚拟化分支就是`native_load_idt()`，定义见之前的代码
 * `native_load_idt()`用`lidt`指令将`&idt_descr`加载到`idtr`寄存器
 * arch/x86/include/asm/desc.h
-  ```c
+  ```cpp
   static inline void native_load_idt(const struct desc_ptr *dtr)
   {
           asm volatile("lidt %0"::"m" (*dtr));
@@ -391,7 +401,7 @@ start_kernel()
   }
   ```
   * arch/x86/kernel/traps.c
-  ```c
+  ```cpp
   void __init trap_init(void)
   {
           /* Init cpu_entry_area before IST entries are set up */
@@ -419,7 +429,6 @@ start_kernel()
 
           idt_setup_debugidt_traps();
   }
-  ...*```
   ```
 
 ## x86的`do_IRQ()`
@@ -431,7 +440,7 @@ start_kernel()
 * `struct irq_desc irq_desc[NR_IRQS]`数组的初值
   - 索引是中断向量，值是`struct irq_desc`实例
   - kernel/irq/irqdesc.c
-  ```c
+  ```cpp
   struct irq_desc irq_desc[NR_IRQS] __cacheline_aligned_in_smp = {
           [0 ... NR_IRQS-1] = {
                   .handle_irq     = handle_bad_irq,
@@ -444,20 +453,21 @@ start_kernel()
 * `vector_irq`则是 per-CPU 的存储指向`struct irq_desc`实例的指针
 * 声明
   - arch/x86/include/asm/hw_irq.h
-  ```c
+  ```cpp
   typedef struct irq_desc* vector_irq_t[NR_VECTORS];
   DECLARE_PER_CPU(vector_irq_t, vector_irq);
   ```
 * 初值
   - arch/x86/kernel/irqinit.c
-  ```c
+  ```cpp
   DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
           [0 ... NR_VECTORS - 1] = VECTOR_UNUSED,
   };
   ```
 
-### Call Trace
-```c
+### 到中断通用入口 `common_interrupt`
+#### Call Trace
+```cpp
 irq_entries_start
 -> jmp common_interrupt
    -> interrupt do_IRQ
@@ -468,7 +478,7 @@ irq_entries_start
 * Per-CPU 的`struct pt_regs`类型的`irq_regs`变量用于保存被中断时的寄存器的值。
   * 这些值是在调用`do_IRQ()`前在汇编入口例程中保存的。
 * arch/x86/include/asm/irq_regs.h
-  ```c
+  ```cpp
   DECLARE_PER_CPU(struct pt_regs *, irq_regs);
 
   static inline struct pt_regs *get_irq_regs(void)
@@ -487,7 +497,7 @@ irq_entries_start
   }
   ```
 * include/linux/irqdesc.h
-  ```c
+  ```cpp
   /*
    * Architectures call this to let the generic IRQ layer
    * handle an interrupt.
@@ -498,7 +508,7 @@ irq_entries_start
   }
   ```
 * arch/x86/kernel/irq.c
-  ```c
+  ```cpp
   /*
    * do_IRQ handles all normal device IRQ's (the special
    * SMP cross-CPU interrupts have their own specific
@@ -541,7 +551,7 @@ irq_entries_start
   }
   ```
 * arch/x86/entry/entry_64.S
-  ```c
+  ```cpp
   /*
    * Build the entry stubs with some assembler magic.
    * We pack 1 stub into every 8-byte block.
@@ -604,7 +614,7 @@ irq_entries_start
            */
           movq    %rsp, %rdi
           incl    PER_CPU_VAR(irq_count)
-          cmovzq  PER_CPU_VAR(irq_stack_ptr), %rsp
+          cmovzq  PER_CPU_VAR(irq_stack_ptr), %rsp /* 中断栈的切换是由内核完成的 */
           pushq   %rdi
           /* We entered an interrupt context - irqs are off: */
           TRACE_IRQS_OFF
@@ -646,8 +656,8 @@ irq_entries_start
   #ifdef CONFIG_PREEMPT
           /* Interrupts are off */
           /* Check if we need preemption */
-          bt      $9, EFLAGS(%rsp)                /* were interrupts off? */
-          jnc     1f
+          bt      $9, EFLAGS(%rsp)                /* were interrupts off? */ /*测试 EFLAGS 的 bit 9，即 IF 的值存入 CF*/
+          jnc     1f  /*检查 CF 即检查 IF，中断是否关闭。如果 CF=0，表示中断关闭，则前跳至 1，不抢占；否则往下执行*/
   0:      cmpl    $0, PER_CPU_VAR(__preempt_count) /*读取抢占计数，看能否进行内核抢占*/
           jnz     1f                    /*如果抢占计数不为 0，通过跳转到 lable 1 返回原执行点*/
           call    preempt_schedule_irq  /*如果抢占计数为 0，触发内核抢占，这里是内核抢占的一个点*/
@@ -659,3 +669,283 @@ irq_entries_start
            */
           TRACE_IRQS_IRETQ
   ```
+
+#### 较新内核的实现
+* `irq_entries_start` 的实现有所不同，跳转到通用中断入口 `asm_common_interrupt`
+* arch/x86/include/asm/idtentry.h
+```cpp
+/*
+ * ASM code to emit the common vector entry stubs where each stub is
+ * packed into IDT_ALIGN bytes.
+ *
+ * Note, that the 'pushq imm8' is emitted via '.byte 0x6a, vector' because
+ * GCC treats the local vector variable as unsigned int and would expand
+ * all vectors above 0x7F to a 5 byte push. The original code did an
+ * adjustment of the vector number to be in the signed byte range to avoid
+ * this. While clever it's mindboggling counterintuitive and requires the
+ * odd conversion back to a real vector number in the C entry points. Using
+ * .byte achieves the same thing and the only fixup needed in the C entry
+ * point is to mask off the bits above bit 7 because the push is sign
+ * extending.
+ */
+    .align IDT_ALIGN
+SYM_CODE_START(irq_entries_start)
+    vector=FIRST_EXTERNAL_VECTOR
+    .rept NR_EXTERNAL_VECTORS
+    UNWIND_HINT_IRET_REGS
+0 :
+    ENDBR
+    .byte   0x6a, vector
+    jmp asm_common_interrupt
+    /* Ensure that the above is IDT_ALIGN bytes max */
+    .fill 0b + IDT_ALIGN - ., 1, 0xcc
+    vector = vector+1
+    .endr
+SYM_CODE_END(irq_entries_start)
+...
+#define DECLARE_IDTENTRY_ERRORCODE(vector, func)            \
+    idtentry vector asm_##func func has_error_code=1
+...
+/**
+ * DECLARE_IDTENTRY_IRQ - Declare functions for device interrupt IDT entry
+ *            points (common/spurious)
+ * @vector: Vector number (ignored for C)
+ * @func:   Function name of the entry point
+ *
+ * Maps to DECLARE_IDTENTRY_ERRORCODE()
+ */
+#define DECLARE_IDTENTRY_IRQ(vector, func)              \
+    DECLARE_IDTENTRY_ERRORCODE(vector, func)
+...
+/* Entries for common/spurious (device) interrupts */
+#define DECLARE_IDTENTRY_IRQ(vector, func)              \
+    idtentry_irq vector func
+...
+/* Device interrupts common/spurious */
+DECLARE_IDTENTRY_IRQ(X86_TRAP_OTHER,    common_interrupt);
+```
+* `asm_common_interrupt` 由 `idtentry` 汇编宏生成，最终会调用 `common_interrupt()`
+* arch/x86/kernel/irq.c
+```cpp
+/*
+ * common_interrupt() handles all normal device IRQ's (the special SMP
+ * cross-CPU interrupts have their own entry points).
+ */
+DEFINE_IDTENTRY_IRQ(common_interrupt)
+{
+    struct pt_regs *old_regs = set_irq_regs(regs);
+    struct irq_desc *desc;
+
+    /* entry code tells RCU that we're not quiescent.  Check it. */
+    RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
+
+    desc = __this_cpu_read(vector_irq[vector]);
+    if (likely(!IS_ERR_OR_NULL(desc))) {
+        handle_irq(desc, regs);
+    } else {
+        apic_eoi();
+
+        if (desc == VECTOR_UNUSED) {
+            pr_emerg_ratelimited("%s: %d.%u No irq handler for vector\n",
+                         __func__, smp_processor_id(),
+                         vector);
+        } else {
+            __this_cpu_write(vector_irq[vector], VECTOR_UNUSED);
+        }
+    }
+
+    set_irq_regs(old_regs);
+}
+```
+* 上面看到的 `common_interrupt()` 其实是 `__common_interrupt()`，真正的 `common_interrupt()` 其实是由 `DEFINE_IDTENTRY_IRQ` 宏生成的
+```cpp
+/**
+ * DEFINE_IDTENTRY_IRQ - Emit code for device interrupt IDT entry points
+ * @func:   Function name of the entry point
+ *
+ * The vector number is pushed by the low level entry stub and handed
+ * to the function as error_code argument which needs to be truncated
+ * to an u8 because the push is sign extending.
+ *
+ * irq_enter/exit_rcu() are invoked before the function body and the
+ * KVM L1D flush request is set. Stack switching to the interrupt stack
+ * has to be done in the function body if necessary.
+ */
+#define DEFINE_IDTENTRY_IRQ(func)                   \
+static void __##func(struct pt_regs *regs, u32 vector);         \
+                                    \
+__visible noinstr void func(struct pt_regs *regs,           \
+                unsigned long error_code)           \
+{                                   \
+    irqentry_state_t state = irqentry_enter(regs);          \
+    u32 vector = (u32)(u8)error_code;               \
+                                    \
+    instrumentation_begin();                    \
+    kvm_set_cpu_l1tf_flush_l1d();                   \
+    run_irq_on_irqstack_cond(__##func, regs, vector);       \
+    instrumentation_end();                      \
+    irqentry_exit(regs, state);                 \
+}                                   \
+                                    \
+static noinline void __##func(struct pt_regs *regs, u32 vector)
+```
+* `common_interrupt()` 的最后会调用 C 函数 `irqentry_exit()` 完成旧的汇编代码实现的大部分功能，包括中断处理完成后的内核抢占点
+  * kernel/entry/common.c
+```cpp
+void raw_irqentry_exit_cond_resched(void)
+{
+    if (!preempt_count()) {
+        /* Sanity check RCU and thread stack */
+        rcu_irq_exit_check_preempt();
+        if (IS_ENABLED(CONFIG_DEBUG_ENTRY))
+            WARN_ON_ONCE(!on_thread_stack());
+        if (need_resched())
+            preempt_schedule_irq();
+    }
+}
+#ifdef CONFIG_PREEMPT_DYNAMIC
+#if defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)
+DEFINE_STATIC_CALL(irqentry_exit_cond_resched, raw_irqentry_exit_cond_resched);
+#elif defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)
+DEFINE_STATIC_KEY_TRUE(sk_dynamic_irqentry_exit_cond_resched);
+void dynamic_irqentry_exit_cond_resched(void)
+{
+    if (!static_branch_unlikely(&sk_dynamic_irqentry_exit_cond_resched))
+        return;
+    raw_irqentry_exit_cond_resched();
+}
+#endif
+#endif
+
+noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
+{
+    /* Check whether this returns to user mode */
+    if (user_mode(regs)) {
+        irqentry_exit_to_user_mode(regs);
+    } else if (!regs_irqs_disabled(regs)) { //检查 EFLAGS 的 IF bit，如果中断未关闭
+...
+        instrumentation_begin();
+        if (IS_ENABLED(CONFIG_PREEMPTION))
+            irqentry_exit_cond_resched();
+
+        /* Covers both tracing and lockdep */
+        trace_hardirqs_on();
+        instrumentation_end();
+...
+    }
+}
+```
+* 不用担心中断返回时被内核抢占。比如说
+1. 进程 A 在内核态被中断，它的上下文 a1 被 `error_entry` 压入进程内核栈，然后进行中断处理
+2. 切换到 per CPU 的中断栈的过程略过，中断处理 `__common_interrupt` 完成后要切换回 A 的内核栈的（见 `call_on_stack` 宏的实现）
+3. 中断返回前 `irqentry_exit()` 处发生内核抢占，被进程 B 抢占，此时 A 的上下文 a2 （被`__switch_to_asm`）保存在 A 的内核栈以及（被 `__switch_to()`）PCB 中
+4. 进程 B 又被中断，中断返回前再次发生内核抢占，假设被进程 A 抢了回来
+5. A 的上下文 a2 从 A 的内核栈（`__switch_to_asm`）以及 PCB（`__switch_to()`）中恢复，如果不再发生内核抢占，会继续执行，从 `irqentry_exit()` 返回
+6. 最后会通过 `error_return` 返回进程 A 最初被中断的上下文 a1
+```cpp
+idtentry
+    idtentry_body
+        call    \cfunc
+        jmp error_return
+```
+* arch/x86/entry/entry_64.S
+```cpp
+SYM_CODE_START_LOCAL(error_return)
+    UNWIND_HINT_REGS
+    DEBUG_ENTRY_ASSERT_IRQS_OFF
+    testb   $3, CS(%rsp)
+    jz  restore_regs_and_return_to_kernel
+    jmp swapgs_restore_regs_and_return_to_usermode
+SYM_CODE_END(error_return)
+```
+* 进入硬件中断处理函数时，修改硬中断 `preempt_count()` 的抢占计数的地方比较隐蔽，在 `run_irq_on_irqstack_cond()` 的第三个参数中构造的内联汇编中调用 `call irq_enter_rcu/call irq_exit_rcu` 来实现
+  * arch/x86/include/asm/irq_stack.h
+```c
+#define call_on_stack(stack, func, asm_call, argconstr...)      \
+{                                   \
+    register void *tos asm("r11");                  \
+                                    \
+    tos = ((void *)(stack));                    \
+                                    \
+    asm_inline volatile(                        \
+    "movq   %%rsp, (%[tos])             \n"     \
+    "movq   %[tos], %%rsp               \n"     \
+                                    \
+    asm_call                            \
+                                    \
+    "popq   %%rsp                   \n"     \
+                                    \
+    : "+r" (tos), ASM_CALL_CONSTRAINT               \
+    : [__func] "i" (func), [tos] "r" (tos) argconstr        \
+    : "cc", "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",   \
+      "memory"                          \
+    );                              \
+}
+
+#define ASM_CALL_ARG0                           \
+    "1: call %c[__func]             \n"     \
+    ANNOTATE_REACHABLE(1b)
+
+#define ASM_CALL_ARG1                           \
+    "movq   %[arg1], %%rdi              \n"     \
+    ASM_CALL_ARG0
+
+#define ASM_CALL_ARG2                           \
+    "movq   %[arg2], %%rsi              \n"     \
+    ASM_CALL_ARG1
+
+#define ASM_CALL_ARG3                           \
+    "movq   %[arg3], %%rdx              \n"     \
+    ASM_CALL_ARG2
+
+#define call_on_irqstack(func, asm_call, argconstr...)          \
+    call_on_stack(__this_cpu_read(pcpu_hot.hardirq_stack_ptr),  \
+              func, asm_call, argconstr)
+...
+/*
+ * Macro to invoke system vector and device interrupt C handlers.
+ */
+#define call_on_irqstack_cond(func, regs, asm_call, constr, c_args...)  \
+{                                   \
+    /*                              \
+     * User mode entry and interrupt on the irq stack do not    \
+     * switch stacks. If from user mode the task stack is empty.    \
+     */                             \
+    if (user_mode(regs) || __this_cpu_read(pcpu_hot.hardirq_stack_inuse)) { \
+        irq_enter_rcu();                    \
+        func(c_args);                       \
+        irq_exit_rcu();                     \
+    } else {                            \
+        /*                          \
+         * Mark the irq stack inuse _before_ and unmark _after_ \
+         * switching stacks. Interrupts are disabled in both    \
+         * places. Invoke the stack switch macro with the call  \
+         * sequence which matches the above direct invocation.  \
+         */                         \
+        __this_cpu_write(pcpu_hot.hardirq_stack_inuse, true);   \
+        call_on_irqstack(func, asm_call, constr);       \
+        __this_cpu_write(pcpu_hot.hardirq_stack_inuse, false);  \
+    }                               \
+}
+...
+/*
+ * As in ASM_CALL_SYSVEC above the clobbers force the compiler to store
+ * @regs and @vector in callee saved registers.
+ */
+#define ASM_CALL_IRQ                            \
+    "call irq_enter_rcu             \n"     \ //增加 HARDIRQ_OFFSET 的抢占计数
+    ASM_CALL_ARG2                           \ //调用 __common_interrupt()
+    "call irq_exit_rcu              \n"       //减小 HARDIRQ_OFFSET 的抢占计数
+
+#define IRQ_CONSTRAINTS , [arg1] "r" (regs), [arg2] "r" ((unsigned long)vector)
+
+#define run_irq_on_irqstack_cond(func, regs, vector)            \
+{                                   \
+    assert_function_type(func, void (*)(struct pt_regs *, u32));    \
+    assert_arg_type(regs, struct pt_regs *);            \
+    assert_arg_type(vector, u32);                   \
+                                    \
+    call_on_irqstack_cond(func, regs, ASM_CALL_IRQ,         \
+                  IRQ_CONSTRAINTS, regs, vector);       \
+}
+```
